@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# revkit -- unified headless binary analysis CLI
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec python -m revkit.tools.cli.main "$@"

@@ -1,0 +1,19 @@
+[project]
+name = "revkit"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+full = ["psutil>=5.9"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+revkit = "revkit.tools.cli.main:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

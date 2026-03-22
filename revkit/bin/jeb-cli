@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# jeb-cli -- legacy wrapper for revkit jeb
+if [ -z "$REVKIT_NO_DEPRECATION_WARN" ]; then
+    echo "[DEPRECATED] Use 'revkit jeb ...' instead" >&2
+fi
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec python -m revkit.tools.cli.main jeb "$@"
