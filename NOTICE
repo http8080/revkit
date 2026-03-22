@@ -1,0 +1,31 @@
+revkit - Unified Headless Binary Analysis CLI
+Copyright 2026 http8080
+
+Licensed under the Apache License, Version 2.0.
+
+Third-Party Software Notices
+=============================
+
+This project provides a CLI interface for the following commercial tools.
+Users must obtain their own licenses to use these tools.
+
+IDA Pro
+-------
+IDA Pro is a product of Hex-Rays SA (https://hex-rays.com/).
+revkit does NOT include, distribute, or modify any IDA Pro binaries.
+revkit communicates with IDA Pro via IDAPython scripts executed in
+IDA's headless mode (idat/idat64 -A -S). Users must have a valid
+IDA Pro license to use IDA-related features.
+
+JEB Decompiler
+--------------
+JEB is a product of PNF Software (https://www.pnfsoftware.com/).
+revkit does NOT include, distribute, or modify any JEB binaries.
+revkit communicates with JEB via Jython scripts executed through
+JEB's scripting interface. Users must have a valid JEB license
+to use JEB-related features.
+
+APKEditor
+---------
+APKEditor (tools/libs/APKEditor-1.4.7.jar) is included under its
+own license. See https://github.com/nicehash/APKEditor for details.

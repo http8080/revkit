@@ -682,4 +682,23 @@ python -m revkit.tools.scripts.migrate --verify
 
 ## License / 라이선스
 
-Private. / 비공개.
+This project is licensed under the **Apache License 2.0** — see [LICENSE](LICENSE) for details.
+
+이 프로젝트는 **Apache License 2.0** 하에 배포됩니다 — [LICENSE](LICENSE) 참조.
+
+### Third-Party Software / 서드파티 소프트웨어
+
+revkit is a CLI tool that **interfaces with** but does **not include or distribute** the following commercial software:
+
+revkit은 아래 상용 소프트웨어와 **연동**하는 CLI 도구이며, 해당 소프트웨어를 **포함하거나 배포하지 않습니다**:
+
+| Software | Vendor | License Required |
+|----------|--------|-----------------|
+| **IDA Pro** | [Hex-Rays SA](https://hex-rays.com/) | Yes — users must have a valid IDA Pro license |
+| **JEB Decompiler** | [PNF Software](https://www.pnfsoftware.com/) | Yes — users must have a valid JEB license |
+
+- IDA Pro and JEB must be **separately installed and licensed** by the user.
+- revkit communicates with these tools via their scripting APIs (IDAPython / Jython).
+- No proprietary code, binaries, or libraries from IDA or JEB are included in this repository.
+
+See [NOTICE](NOTICE) for full attribution details.
