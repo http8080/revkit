@@ -1,6 +1,6 @@
 # revkit
 
-**Unified headless binary analysis CLI framework for IDA Pro + JEB.**
+**headless binary analysis CLI framework for IDA Pro + JEB.**
 
 IDA Pro + JEB 통합 headless 바이너리 분석 CLI 프레임워크.
 
