@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -129,6 +130,8 @@ def post_rpc(
                         "INVALID_RESPONSE",
                         f"HTTP {resp.status}: {raw[:200]}",
                     )
+        except (TimeoutError, socket.timeout) as e:
+            raise RpcError("TIMEOUT", f"Request timeout ({timeout}s)")
         except urllib.error.URLError as e:
             last_err = e
             # Check if this is a timeout (wrapped as URLError on some platforms)

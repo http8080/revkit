@@ -220,11 +220,15 @@ def cmd_stop(args, config, engine):
             # IDA uses "save_db", JEB uses "save" — pick correct method
             save_method = "save_db" if engine.engine_name == "ida" else "save"
             log.debug("cmd_stop: sending %s RPC to %s", save_method, url)
-            post_rpc(url, save_method, auth_token=token, trace_id=trace_id,
-                     timeout=stop_timeout, retries=1)
-            log_info(f"Database saved for {iid}")
+            try:
+                post_rpc(url, save_method, auth_token=token, trace_id=trace_id,
+                         timeout=stop_timeout, retries=1)
+                log_info(f"Database saved for {iid}")
+            except RpcError as exc:
+                log.warning("cmd_stop: save failed for %s: %s (proceeding to stop)", iid, exc)
             log.debug("cmd_stop: sending stop RPC")
-            post_rpc(url, "stop", auth_token=token, trace_id=trace_id, retries=1)
+            post_rpc(url, "stop", auth_token=token, trace_id=trace_id,
+                     timeout=stop_timeout, retries=1)
         except RpcError as exc:
             log.warning("cmd_stop: RPC failed for %s: %s", iid, exc)
 
