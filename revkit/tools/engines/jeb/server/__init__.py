@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-"""JEB Headless Server package -- Jython-based HTTP JSON-RPC server."""
-# Note: server/ runs under Jython 2.7. Import structure differs from CLI.
-# main(ctx) is called from jeb_server.py IScript entry point.
+"""JEB Headless Server package.
 
-def main(ctx):
-    from .framework import run_server
-    run_server(ctx)
+Primary: Java server (server/java/revkit-jeb-server.jar)
+Legacy:  Jython server preserved in server/legacy/ for rollback.
+"""

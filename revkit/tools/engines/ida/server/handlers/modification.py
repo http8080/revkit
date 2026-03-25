@@ -8,6 +8,7 @@ from ..framework import (
     RpcError, _fmt_addr, _require_param, _resolve_addr,
     _parse_and_apply_type, _bytes_to_hex,
     _maybe_save_db, save_db, _save_output,
+    invalidate_func_name_cache, invalidate_decompile_cache,
 )
 
 
@@ -38,6 +39,8 @@ def _handle_rename_batch(params):
             results["failed"] += 1
             results["renames"].append({"addr": str(addr_str), "name": str(name), "ok": False, "error": str(e)})
     if results["success"] > 0:
+        invalidate_func_name_cache()  # Batch rename — clear entire cache
+        invalidate_decompile_cache()
         _maybe_save_db()
     return results
 
@@ -49,6 +52,8 @@ def _handle_set_name(params):
     ok = idc.set_name(ea, name, idc.SN_NOWARN | idc.SN_NOCHECK)
     if not ok:
         raise RpcError("SET_NAME_FAILED", f"Cannot set name at {_fmt_addr(ea)}")
+    invalidate_func_name_cache(ea)
+    invalidate_decompile_cache(ea)
     _maybe_save_db()
     return {"ok": True, "addr": _fmt_addr(ea), "name": name}
 
@@ -84,6 +89,7 @@ def _handle_set_type(params):
     ea = _resolve_addr(params.get("addr"))
     type_str = _require_param(params, "type")
     tif = _parse_and_apply_type(ea, type_str)
+    invalidate_decompile_cache(ea)  # Type change affects decompile output
     _maybe_save_db()
     return {"ok": True, "addr": _fmt_addr(ea), "type": str(tif)}
 

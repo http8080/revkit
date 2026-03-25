@@ -6,25 +6,29 @@ from ..framework import RpcError, _require_param
 
 
 def _handle_snapshot_save(params):
-    """Save IDB snapshot."""
+    """Save IDB snapshot.
+    Optimization: try IDA snapshot API first (no pre-save needed), only save DB on fallback."""
     import ida_loader, ida_kernwin
     desc = params.get("description", "Snapshot")
-    ok = ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB), 0)
     try:
         ss = ida_kernwin.snapshot_t()
         ss.desc = desc
         ok = ida_kernwin.take_database_snapshot(ss)
-        return {"ok": bool(ok), "description": desc, "filename": ss.filename if ok else ""}
-    except Exception as e:
-        idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-        import shutil, datetime, json as _json
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup = f"{idb_path}.snapshot_{ts}"
-        shutil.copy2(idb_path, backup)
-        meta = {"description": desc, "created": datetime.datetime.now().isoformat()}
-        with open(backup + ".meta.json", "w", encoding="utf-8") as mf:
-            _json.dump(meta, mf, ensure_ascii=False)
-        return {"ok": True, "description": desc, "filename": backup, "method": "file_copy"}
+        if ok:
+            return {"ok": True, "description": desc, "filename": ss.filename}
+    except Exception:
+        pass
+    # Fallback: save DB first, then file copy
+    ida_loader.save_database(ida_loader.get_path(ida_loader.PATH_TYPE_IDB), 0)
+    idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    import shutil, datetime, json as _json
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup = f"{idb_path}.snapshot_{ts}"
+    shutil.copy2(idb_path, backup)
+    meta = {"description": desc, "created": datetime.datetime.now().isoformat()}
+    with open(backup + ".meta.json", "w", encoding="utf-8") as mf:
+        _json.dump(meta, mf, ensure_ascii=False)
+    return {"ok": True, "description": desc, "filename": backup, "method": "file_copy"}
 
 
 def _handle_snapshot_list(params):

@@ -72,22 +72,44 @@ def check_ip_whitelist(client_ip: str, allowed_ips: list[str]) -> bool:
     return _ip_in_list(client_ip, allowed_ips)
 
 
+_compiled_ip_cache: dict[tuple, list] = {}
+
+
+def _compile_ip_list(ip_list: list[str]) -> list:
+    """Parse IP/CIDR strings into ipaddress objects (cached by content)."""
+    key = tuple(ip_list)
+    cached = _compiled_ip_cache.get(key)
+    if cached is not None:
+        return cached
+    compiled = []
+    for entry in ip_list:
+        try:
+            if "/" in entry:
+                compiled.append(ipaddress.ip_network(entry, strict=False))
+            else:
+                compiled.append(ipaddress.ip_address(entry))
+        except ValueError:
+            log.warning("Invalid IP/CIDR entry: %s", entry)
+    _compiled_ip_cache[key] = compiled
+    return compiled
+
+
 def _ip_in_list(ip_str: str, ip_list: list[str]) -> bool:
-    """Check if ip_str matches any entry in ip_list (exact or CIDR)."""
+    """Check if ip_str matches any entry in ip_list (exact or CIDR).
+
+    Uses pre-compiled IP objects to avoid re-parsing on every request.
+    """
     try:
         addr = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    for entry in ip_list:
-        try:
-            if "/" in entry:
-                if addr in ipaddress.ip_network(entry, strict=False):
-                    return True
-            else:
-                if addr == ipaddress.ip_address(entry):
-                    return True
-        except ValueError:
-            continue
+    for net_or_addr in _compile_ip_list(ip_list):
+        if isinstance(net_or_addr, (ipaddress.IPv4Network, ipaddress.IPv6Network)):
+            if addr in net_or_addr:
+                return True
+        else:
+            if addr == net_or_addr:
+                return True
     return False
 
 

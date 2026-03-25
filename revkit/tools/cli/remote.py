@@ -68,6 +68,68 @@ def post_rpc_remote(
         raise RuntimeError(f"Gateway unreachable: {e}") from e
 
 
+class _StreamingUploadBody:
+    """File-like wrapper that streams multipart body without loading file into memory.
+
+    Peak memory: ~128KB instead of 2x file size.
+    """
+    _CHUNK = 65536
+
+    def __init__(self, file_path: str, boundary: str, filename: str):
+        self._file_path = file_path
+        self._preamble = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        self._epilogue = f"\r\n--{boundary}--\r\n".encode()
+        file_size = os.path.getsize(file_path)
+        self._total = len(self._preamble) + file_size + len(self._epilogue)
+        self._pos = 0
+        self._file = None
+        self._phase = 0  # 0=preamble, 1=file, 2=epilogue, 3=done
+        self._epi_pos = 0
+
+    def __len__(self):
+        return self._total
+
+    def read(self, size=-1):
+        if size == -1:
+            size = self._total - self._pos
+        result = b""
+        while len(result) < size and self._phase < 3:
+            remaining = size - len(result)
+            if self._phase == 0:
+                chunk = self._preamble[self._pos:self._pos + remaining]
+                result += chunk
+                self._pos += len(chunk)
+                if self._pos >= len(self._preamble):
+                    self._phase = 1
+                    self._file = open(self._file_path, "rb")
+            elif self._phase == 1:
+                chunk = self._file.read(min(remaining, self._CHUNK))
+                if not chunk:
+                    self._file.close()
+                    self._file = None
+                    self._phase = 2
+                    continue
+                result += chunk
+                self._pos += len(chunk)
+            elif self._phase == 2:
+                chunk = self._epilogue[self._epi_pos:self._epi_pos + remaining]
+                result += chunk
+                self._pos += len(chunk)
+                self._epi_pos += len(chunk)
+                if self._epi_pos >= len(self._epilogue):
+                    self._phase = 3
+        return result
+
+    def close(self):
+        if self._file:
+            self._file.close()
+            self._file = None
+
+
 def upload_binary(
     gateway_url: str,
     file_path: str,
@@ -90,15 +152,7 @@ def upload_binary(
     filename = os.path.basename(file_path).replace('"', '_')  # M15: escape quotes
 
     boundary = uuid.uuid4().hex
-    with open(file_path, "rb") as f:
-        file_data = f.read()
-
-    body = bytearray()
-    body += f"--{boundary}\r\n".encode()
-    body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
-    body += b"Content-Type: application/octet-stream\r\n\r\n"
-    body += file_data
-    body += f"\r\n--{boundary}--\r\n".encode()
+    body = _StreamingUploadBody(file_path, boundary, filename)
 
     headers = {
         "Content-Type": f"multipart/form-data; boundary={boundary}",
@@ -107,7 +161,7 @@ def upload_binary(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
-    req = urllib.request.Request(url, data=bytes(body), headers=headers, method="POST")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -121,6 +175,8 @@ def upload_binary(
         raise RuntimeError(f"Upload HTTP {e.code}: {body_text}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Gateway unreachable: {e}") from e
+    finally:
+        body.close()
 
 
 def remote_start(

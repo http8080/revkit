@@ -1,6 +1,7 @@
 """Annotations API — export/import names, comments, types."""
 
 import os
+import re
 
 from ..framework import (
     _fmt_addr, _resolve_addr, _save_output, _require_param,
@@ -8,13 +9,35 @@ from ..framework import (
 )
 from .. import framework as _fw
 
+# Compiled regex for auto-generated prefix matching (O(1) vs O(n) per name)
+_AUTO_GEN_RE = re.compile(r'^(?:' + '|'.join(re.escape(p) for p in AUTO_GENERATED_PREFIXES) + r')')
 
-def _collect_function_annotations(annotations):
-    """Collect names, comments, and types from functions."""
-    import idc, idautils
+
+def _is_user_name(name):
+    """Check if name is user-defined (not auto-generated). Uses compiled regex."""
+    return bool(name) and not _AUTO_GEN_RE.match(name)
+
+
+def _handle_export_annotations(params):
+    """Export all user-applied names, comments, and types.
+    Optimization: single pass over Functions() + Names() with compiled prefix regex."""
+    import idc, ida_nalt, idautils, ida_funcs
+    annotations = {
+        "binary": os.path.basename(idc.get_input_file_path()),
+        "imagebase": _fmt_addr(ida_nalt.get_imagebase()),
+        "names": [],
+        "comments": [],
+        "types": [],
+    }
+
+    # Collect function EAs in a set for quick membership test in Names() pass
+    func_eas = set()
+
+    # Single pass: functions — names + comments + types
     for ea in idautils.Functions():
+        func_eas.add(ea)
         name = idc.get_func_name(ea)
-        if name and not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
+        if _is_user_name(name):
             annotations["names"].append({"addr": _fmt_addr(ea), "name": name})
         cmt = idc.get_cmt(ea, False)
         rcmt = idc.get_cmt(ea, True)
@@ -29,32 +52,13 @@ def _collect_function_annotations(annotations):
         if type_str:
             annotations["types"].append({"addr": _fmt_addr(ea), "type": type_str})
 
-
-def _collect_global_names(annotations):
-    """Collect non-function names (globals, data labels)."""
-    import idautils, ida_funcs
+    # Single pass: global names (non-function, skip already-collected function EAs)
     for item in idautils.Names():
-        ea = item[0]
-        name = item[1]
-        if not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
-            func = ida_funcs.get_func(ea)
-            if not func:
-                annotations["names"].append({"addr": _fmt_addr(ea), "name": name})
+        ea, name = item[0], item[1]
+        if ea not in func_eas and _is_user_name(name):
+            annotations["names"].append({"addr": _fmt_addr(ea), "name": name})
 
-
-def _handle_export_annotations(params):
-    """Export all user-applied names, comments, and types."""
-    import idc, ida_nalt
-    annotations = {
-        "binary": os.path.basename(idc.get_input_file_path()),
-        "imagebase": _fmt_addr(ida_nalt.get_imagebase()),
-        "names": [],
-        "comments": [],
-        "types": [],
-    }
-    _collect_function_annotations(annotations)
-    _collect_global_names(annotations)
-    saved_to = _save_output(params.get("output"), annotations, fmt="json")
+    saved_to = _save_output(params.get("output"), annotations, fmt="json") if params.get("output") else None
     annotations["saved_to"] = saved_to
     return annotations
 

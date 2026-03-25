@@ -172,11 +172,19 @@ def _cleanup_instance(config: dict, iid: str) -> None:
 
 # ── Auth token helpers ───────────────────────────────────
 
+_auth_token_cache: dict[str, str] = {}  # iid -> token
+
+
 def _load_auth_token(config: dict, iid: str) -> str | None:
     """Read bearer token for *iid* from the token file.
 
     Token file format: ``instance_id:port:token`` per line.
+    Uses a module-level cache to avoid re-reading the file on every RPC call.
     """
+    if iid in _auth_token_cache:
+        log.debug("Auth token cache hit for iid=%s", iid)
+        return _auth_token_cache[iid]
+
     token_path = config.get("security", {}).get("auth_token_file", "")
     if not token_path or not os.path.exists(token_path):
         log.debug("No auth token file for iid=%s", iid)
@@ -187,7 +195,9 @@ def _load_auth_token(config: dict, iid: str) -> str | None:
                 parts = line.strip().split(":")
                 if len(parts) >= 3 and parts[0] == iid:
                     log.debug("Auth token loaded for iid=%s", iid)
-                    return parts[2]
+                    token = parts[2]
+                    _auth_token_cache[iid] = token
+                    return token
     except OSError as exc:
         log.warning("Failed to read auth token file %s: %s", token_path, exc)
     log.debug("No auth token entry found for iid=%s", iid)
@@ -196,6 +206,7 @@ def _load_auth_token(config: dict, iid: str) -> str | None:
 
 def remove_auth_token(token_path: str, iid: str) -> None:
     """Remove all token entries for *iid* from the token file."""
+    _auth_token_cache.pop(iid, None)  # invalidate cache
     if not token_path or not os.path.exists(token_path):
         return
     try:
@@ -247,6 +258,7 @@ def _rpc_call(
     config: dict,
     method: str,
     params: dict | None = None,
+    timeout: float | None = None,
 ) -> dict | None:
     """High-level RPC call: resolve instance → post → return result.
 
@@ -262,7 +274,7 @@ def _rpc_call(
     trace_id = getattr(args, '_trace_id', None) or getattr(args, 'trace_id', None)
     log.debug("_rpc_call: method=%s iid=%s port=%s params=%s", method, iid, port,
               list(params.keys()) if params else None)
-    resp = post_rpc(config, port, method, iid, params, trace_id=trace_id)
+    resp = post_rpc(config, port, method, iid, params, timeout=timeout, trace_id=trace_id)
     if "error" in resp:
         err = resp["error"]
         log.debug("_rpc_call: method=%s -> error: %s", method, err.get('message', str(err)))

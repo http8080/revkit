@@ -7,6 +7,7 @@ from ..framework import (
     RpcError, _fmt_addr, _require_param, _clamp_int, _bytes_to_hex,
     _require_function, _require_decompiler, _resolve_addr, _save_output,
     _xref_type_str, _resolve_start_addr,
+    cached_decompile, cached_func_name,
     MAX_BATCH_DECOMPILE, MAX_DISASM_LINES, DEFAULT_DISASM_COUNT,
     MAX_READ_BYTES, DEFAULT_FIND_MAX, MAX_FIND_RESULTS,
     DEFAULT_SEARCH_MAX, MAX_SEARCH_RESULTS,
@@ -14,10 +15,16 @@ from ..framework import (
 
 
 def _decompile_func(ea):
-    """Decompile function at ea. Returns (func, code, name)."""
-    import ida_hexrays, idc
+    """Decompile function at ea. Returns (func, code, name). Uses cache."""
+    import ida_hexrays
     _require_decompiler()
     func = _require_function(ea)
+    # Try cache first
+    code = cached_decompile(func.start_ea)
+    if code is not None:
+        name = cached_func_name(func.start_ea)
+        return func, code, name
+    # Cache miss — decompile directly (for better error reporting)
     try:
         cfunc = ida_hexrays.decompile(func.start_ea)
         if not cfunc:
@@ -25,7 +32,7 @@ def _decompile_func(ea):
         code = str(cfunc)
     except ida_hexrays.DecompilationFailure as e:
         raise RpcError("DECOMPILE_FAILED", str(e))
-    name = idc.get_func_name(func.start_ea) or ""
+    name = cached_func_name(func.start_ea)
     return func, code, name
 
 
@@ -42,14 +49,14 @@ def _handle_decompile(params):
 
 def _handle_decompile_with_xrefs(params):
     """Decompile + xrefs_to in a single call."""
-    import idautils, idc, ida_funcs
+    import idautils, ida_funcs
     ea = _resolve_addr(params.get("addr"))
     func, code, name = _decompile_func(ea)
     callers = []
     for xref in idautils.XrefsTo(func.start_ea):
         callers.append({
             "from_addr": _fmt_addr(xref.frm),
-            "from_name": idc.get_func_name(xref.frm) or "",
+            "from_name": cached_func_name(xref.frm),
             "type": _xref_type_str(xref.type),
         })
     callees = []
@@ -62,7 +69,7 @@ def _handle_decompile_with_xrefs(params):
                     seen.add(target_func.start_ea)
                     callees.append({
                         "to_addr": _fmt_addr(target_func.start_ea),
-                        "to_name": idc.get_func_name(target_func.start_ea) or "",
+                        "to_name": cached_func_name(target_func.start_ea),
                         "type": _xref_type_str(xref.type),
                     })
     output = f"// {name} @ {_fmt_addr(func.start_ea)}\n{code}"
@@ -82,7 +89,7 @@ def _handle_decompile_with_xrefs(params):
 
 def _handle_decompile_batch(params):
     _require_decompiler()
-    import ida_hexrays, idc, ida_funcs
+    import ida_funcs
     addrs = params.get("addrs", [])
     if len(addrs) > MAX_BATCH_DECOMPILE:
         raise RpcError("INVALID_PARAMS", f"Maximum {MAX_BATCH_DECOMPILE} addresses per batch")
@@ -95,15 +102,15 @@ def _handle_decompile_batch(params):
             if not func:
                 results.append({"addr": _fmt_addr(ea), "name": "", "error": "NOT_A_FUNCTION"})
                 continue
-            cfunc = ida_hexrays.decompile(func.start_ea)
-            if not cfunc:
+            code = cached_decompile(func.start_ea)
+            if not code:
                 results.append({"addr": _fmt_addr(func.start_ea),
-                                "name": idc.get_func_name(func.start_ea) or "",
+                                "name": cached_func_name(func.start_ea),
                                 "error": "DECOMPILE_FAILED"})
                 continue
             results.append({"addr": _fmt_addr(func.start_ea),
-                            "name": idc.get_func_name(func.start_ea) or "",
-                            "code": str(cfunc)})
+                            "name": cached_func_name(func.start_ea),
+                            "code": code})
             success += 1
         except RpcError:
             results.append({"addr": addr_str, "name": "", "error": "INVALID_ADDRESS"})
@@ -145,33 +152,33 @@ def _handle_disasm(params):
 
 
 def _handle_get_xrefs_to(params):
-    import idautils, idc
+    import idautils
     ea = _resolve_addr(params.get("addr"))
     refs = []
     for xref in idautils.XrefsTo(ea):
         refs.append({
             "from_addr": _fmt_addr(xref.frm),
-            "from_name": idc.get_func_name(xref.frm) or "",
+            "from_name": cached_func_name(xref.frm),
             "type": _xref_type_str(xref.type),
         })
     return {"addr": _fmt_addr(ea), "total": len(refs), "refs": refs}
 
 
 def _handle_get_xrefs_from(params):
-    import idautils, idc
+    import idautils
     ea = _resolve_addr(params.get("addr"))
     refs = []
     for xref in idautils.XrefsFrom(ea):
         refs.append({
             "to_addr": _fmt_addr(xref.to),
-            "to_name": idc.get_func_name(xref.to) or "",
+            "to_name": cached_func_name(xref.to),
             "type": _xref_type_str(xref.type),
         })
     return {"addr": _fmt_addr(ea), "total": len(refs), "refs": refs}
 
 
 def _handle_find_func(params):
-    import idautils, idc
+    import idautils
     name = _require_param(params, "name")
     use_regex = params.get("regex", False)
     max_results = _clamp_int(params, "max_results", DEFAULT_SEARCH_MAX, MAX_SEARCH_RESULTS)
@@ -181,7 +188,7 @@ def _handle_find_func(params):
         raise RpcError("INVALID_PARAMS", f"Invalid regex: {e}")
     matches = []
     for ea in idautils.Functions():
-        fn = idc.get_func_name(ea)
+        fn = cached_func_name(ea)
         if pattern:
             if pattern.search(fn):
                 matches.append({"addr": _fmt_addr(ea), "name": fn})

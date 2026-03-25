@@ -143,9 +143,15 @@ def cmd_stop(ctx: CmdContext):
             post_rpc(config, port, "stop", iid, timeout=STOP_RPC_TIMEOUT)
             for _ in range(STOP_WAIT_ITERATIONS):
                 time.sleep(STOP_POLL_INTERVAL)
-                if iid not in load_registry():
+                # Check process alive instead of re-reading registry from disk each iteration
+                if pid and not _is_process_alive(pid):
                     _log_ok(f"Instance {iid} stopped normally")
-                    return
+                    break
+                if not pid and iid not in load_registry():
+                    _log_ok(f"Instance {iid} stopped normally")
+                    break
+            else:
+                log.debug("cmd_stop: process still alive after wait iterations for %s", iid)
         except Exception:
             log.warning("cmd_stop: RPC stop failed for %s, falling back to force kill", iid)
 
@@ -229,10 +235,9 @@ def cmd_wait(ctx: CmdContext):
             time.sleep(poll)
             continue
         if state == "ready" and port:
-            resp = post_rpc(config, port, "ping", iid)
-            if resp.get("result", {}).get("state") == "ready":
-                _log_ok("ready")
-                return
+            # Registry state is authoritative — server writes "ready" only when fully initialized
+            _log_ok("ready")
+            return
         if state == "error":
             _log_err(f"Analysis failed. Check: ida_cli.py logs {iid}")
             return

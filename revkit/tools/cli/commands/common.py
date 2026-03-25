@@ -174,7 +174,9 @@ def cmd_start(args, config, engine):
     entry["pid"] = pid
     register_instance(reg_path, entry)
 
-    spawn_method = config.get(engine.engine_name, {}).get("spawn_method", "default")
+    engine_cfg = config.get(engine.engine_name, {})
+    server_type = engine_cfg.get("server_type", "")
+    spawn_method = "java" if server_type == "java" else engine_cfg.get("spawn_method", "default")
     log_ok(f"Started {engine.engine_name} (id={instance_id}, pid={pid}, spawn={spawn_method})")
     log_lifecycle(engine.engine_name, "instance.start",
                   instance_id, binary=binary, pid=pid, spawn_method=spawn_method)
@@ -211,14 +213,18 @@ def cmd_stop(args, config, engine):
     if port:
         try:
             host = config.get("server", {}).get("host", "127.0.0.1")
+            if host == "0.0.0.0":
+                host = "127.0.0.1"
             url = f"http://{host}:{port}/"
             token = _load_token_for_instance(config, iid)
-            log.debug("cmd_stop: sending save_db RPC to %s", url)
-            post_rpc(url, "save_db", auth_token=token, trace_id=trace_id,
-                     timeout=stop_timeout)
+            # IDA uses "save_db", JEB uses "save" — pick correct method
+            save_method = "save_db" if engine.engine_name == "ida" else "save"
+            log.debug("cmd_stop: sending %s RPC to %s", save_method, url)
+            post_rpc(url, save_method, auth_token=token, trace_id=trace_id,
+                     timeout=stop_timeout, retries=1)
             log_info(f"Database saved for {iid}")
             log.debug("cmd_stop: sending stop RPC")
-            post_rpc(url, "stop", auth_token=token, trace_id=trace_id)
+            post_rpc(url, "stop", auth_token=token, trace_id=trace_id, retries=1)
         except RpcError as exc:
             log.warning("cmd_stop: RPC failed for %s: %s", iid, exc)
 

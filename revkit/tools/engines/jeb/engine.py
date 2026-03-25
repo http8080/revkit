@@ -85,9 +85,26 @@ class JEBEngine(EngineBase):
 
         heap = self._compute_xmx(binary_path, config, xmx)
         spawn_method = jeb_cfg.get("spawn_method", "wrapper")
+        server_type = jeb_cfg.get("server_type", "jython")  # "java" or "jython"
         cp_sep = ";" if sys.platform == "win32" else ":"
 
-        if spawn_method == "bat":
+        if server_type == "java":
+            # Phase 0.5+: Pure Java server — no Jython overhead
+            java_path = self._resolve_java(config, jeb_dir)
+            jvm_opts = list(jeb_cfg.get("jvm_opts", []))
+            jvm_opts = [o for o in jvm_opts if not o.startswith("-Xmx")]
+            if heap:
+                jvm_opts.insert(0, f"-Xmx{heap}")
+            jar_path = os.path.join(
+                os.path.dirname(__file__), "server", "java",
+                "revkit-jeb-server.jar",
+            )
+            cmd = [java_path] + jvm_opts + [
+                "-cp",
+                os.path.join(jeb_dir, "bin", "app", "*") + cp_sep + jar_path,
+                "revkit.server.JebRpcServer", "--",
+            ] + extra_args
+        elif spawn_method == "bat":
             launcher = self._get_launcher_name()
             cmd = [
                 os.path.join(jeb_dir, launcher),
@@ -148,78 +165,50 @@ class JEBEngine(EngineBase):
         }
 
     def register_commands(self, subparsers: Any) -> None:
-        from .commands import (
-            # instance (local 5 + RPC 1)
-            cmd_init, cmd_check, cmd_restart, cmd_logs, cmd_cleanup,
-            cmd_save,
-            # analysis (RPC proxy 13)
-            cmd_method, cmd_decompile, cmd_decompile_diff,
-            cmd_decompile_batch, cmd_decompile_all,
-            cmd_smali, cmd_strings, cmd_classes,
-            cmd_methods_of_class, cmd_fields_of_class,
-            cmd_method_info, cmd_methods, cmd_native_methods,
-            # recon (RPC proxy 9)
-            cmd_summary, cmd_permissions, cmd_components,
-            cmd_info, cmd_main_activity, cmd_app_class,
-            cmd_resources, cmd_resource, cmd_manifest,
-            # search (RPC proxy 4)
-            cmd_search_classes, cmd_search_methods,
-            cmd_search_code, cmd_strings_xrefs,
-            # modification (RPC proxy 11)
-            cmd_rename, cmd_rename_class, cmd_rename_method,
-            cmd_rename_field, cmd_rename_batch, cmd_rename_preview,
-            cmd_auto_rename, cmd_set_comment, cmd_get_comments,
-            cmd_undo, cmd_bookmark,
-            # xrefs (RPC proxy 5)
-            cmd_xrefs, cmd_callers, cmd_callees,
-            cmd_callgraph, cmd_cross_refs,
-            # report (mixed 8)
-            cmd_annotations_export, cmd_annotations_import, cmd_annotations,
-            cmd_snapshot_save, cmd_snapshot_list, cmd_snapshot_restore,
-            cmd_snapshot, cmd_report,
-            # security (RPC proxy 2)
-            cmd_entry_points, cmd_security_scan,
-            # tooling (local 4)
-            cmd_gen_runner, cmd_patch, cmd_unpatch, cmd_merge,
-            # config (local 2)
-            cmd_config_show, cmd_config_set,
-            # batch (1)
-            cmd_batch,
-            # utility (mixed 2)
-            cmd_exec, cmd_completion,
-        )
+        # Lazy command loader: defer imports until command is actually invoked.
+        # This avoids importing all 67 cmd_* functions on every --help call.
+        def _cmd(qualified: str):
+            """Return a lazy wrapper that imports module.func_name on first call."""
+            module_name, func_name = qualified.rsplit('.', 1)
+            def _invoke(ctx):
+                import importlib
+                mod = importlib.import_module(
+                    f'revkit.tools.engines.jeb.commands.{module_name}')
+                return getattr(mod, func_name)(ctx)
+            _invoke.__name__ = func_name  # for argparse help introspection
+            return _invoke
 
         # ── instance — local (no _inject_common_options) ─────
 
         p = subparsers.add_parser("init", help="Create JEB data directories")
-        p.set_defaults(func=cmd_init)
+        p.set_defaults(func=_cmd('instance.cmd_init'))
 
         p = subparsers.add_parser("check", help="Verify JEB environment")
-        p.set_defaults(func=cmd_check)
+        p.set_defaults(func=_cmd('instance.cmd_check'))
 
         p = subparsers.add_parser("restart", help="Restart a JEB instance")
         p.add_argument("--fresh", action="store_true", help="Force fresh analysis")
         p.add_argument("--wait", action="store_true", help="Wait for ready after restart")
         p.add_argument("--xmx", metavar="SIZE", help="JVM heap size (e.g. 4G)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_restart)
+        p.set_defaults(func=_cmd('instance.cmd_restart'))
 
         p = subparsers.add_parser("logs", help="Show instance log output")
         p.add_argument("-f", "--follow", action="store_true", help="Follow log output")
         p.add_argument("--tail", type=int, default=50, help="Number of lines (default: 50)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_logs)
+        p.set_defaults(func=_cmd('instance.cmd_logs'))
 
         p = subparsers.add_parser("cleanup", help="Clean stale logs and tokens")
         p.add_argument("--dry-run", action="store_true", help="Preview without deleting")
         p.add_argument("--all", action="store_true", help="Stop and clean all instances")
-        p.set_defaults(func=cmd_cleanup)
+        p.set_defaults(func=_cmd('instance.cmd_cleanup'))
 
         # ── instance — RPC (needs _inject_common_options) ────
 
         p = subparsers.add_parser("save", help="Save JEB project database")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_save)
+        p.set_defaults(func=_cmd('instance.cmd_save'))
 
         # ── analysis — RPC proxy ─────────────────────────────
 
@@ -228,7 +217,7 @@ class JEBEngine(EngineBase):
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         p.add_argument("--with-xrefs", action="store_true", help="Include xref info")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_method)
+        p.set_defaults(func=_cmd('analysis.cmd_method'))
 
         p = subparsers.add_parser("decompile", help="Decompile class or method")
         p.add_argument("sig", help="DEX signature (class or method)")
@@ -238,21 +227,21 @@ class JEBEngine(EngineBase):
         p.add_argument("--line-numbers", action="store_true", help="Show line numbers")
         p.add_argument("--no-limit", action="store_true", help="Bypass inline truncation")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_decompile)
+        p.set_defaults(func=_cmd('analysis.cmd_decompile'))
 
         p = subparsers.add_parser("decompile-diff", help="Compare decompile with saved file or previous version")
         p.add_argument("sig", help="DEX signature")
         p.add_argument("diff_file", nargs="?", default=None, help="File to diff against (local mode). Omit for server-side previous version comparison (remote mode).")
         p.add_argument("--out", metavar="PATH", help="Save diff to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_decompile_diff)
+        p.set_defaults(func=_cmd('analysis.cmd_decompile_diff'))
 
         p = subparsers.add_parser("decompile-batch", help="Decompile multiple classes/methods")
         p.add_argument("sigs", nargs="+", help="DEX signatures")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         p.add_argument("--md-out", action="store_true", help="Markdown format output")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_decompile_batch)
+        p.set_defaults(func=_cmd('analysis.cmd_decompile_batch'))
 
         p = subparsers.add_parser("decompile-all", help="Decompile all classes to file(s)")
         p.add_argument("--out", required=True, help="Output path")
@@ -260,13 +249,13 @@ class JEBEngine(EngineBase):
         p.add_argument("--package", metavar="PKG", help="Filter by package (e.g. com.example)")
         p.add_argument("--filter", metavar="PATTERN", help="Filter pattern")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_decompile_all)
+        p.set_defaults(func=_cmd('analysis.cmd_decompile_all'))
 
         p = subparsers.add_parser("smali", help="Get Smali bytecode for class/method")
         p.add_argument("class_sig", help="Class or method DEX signature")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_smali)
+        p.set_defaults(func=_cmd('analysis.cmd_smali'))
 
         p = subparsers.add_parser("strings", help="List strings")
         p.add_argument("--offset", type=int, help="Start offset")
@@ -276,7 +265,7 @@ class JEBEngine(EngineBase):
         p.add_argument("--encoding", help="Filter by encoding (e.g. utf-8, ascii)")
         p.add_argument("--count-only", action="store_true", help="Show count only")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_strings)
+        p.set_defaults(func=_cmd('analysis.cmd_strings'))
 
         p = subparsers.add_parser("classes", help="List classes")
         p.add_argument("--offset", type=int, help="Start offset")
@@ -284,34 +273,34 @@ class JEBEngine(EngineBase):
         p.add_argument("--count-only", action="store_true", help="Show count only")
         p.add_argument("--tree", action="store_true", help="Show as package tree")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_classes)
+        p.set_defaults(func=_cmd('analysis.cmd_classes'))
 
         p = subparsers.add_parser("methods-of-class", help="List methods of a class")
         p.add_argument("class_sig", help="Class DEX signature (e.g. Lcom/example/Foo;)")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_methods_of_class)
+        p.set_defaults(func=_cmd('analysis.cmd_methods_of_class'))
 
         p = subparsers.add_parser("fields-of-class", help="List fields of a class")
         p.add_argument("class_sig", help="Class DEX signature")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_fields_of_class)
+        p.set_defaults(func=_cmd('analysis.cmd_fields_of_class'))
 
         p = subparsers.add_parser("method-info", help="Show method details")
         p.add_argument("method_sig", help="Method DEX signature")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_method_info)
+        p.set_defaults(func=_cmd('analysis.cmd_method_info'))
 
         p = subparsers.add_parser("methods", help="List methods (RPC or of a class)")
         p.add_argument("class_sig", nargs="?", help="Class DEX signature (optional)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_methods)
+        p.set_defaults(func=_cmd('analysis.cmd_methods'))
 
         p = subparsers.add_parser("native-methods", help="List native method declarations")
         p.add_argument("--filter", metavar="PATTERN", help="Filter pattern")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_native_methods)
+        p.set_defaults(func=_cmd('analysis.cmd_native_methods'))
 
         # ── recon — RPC proxy ────────────────────────────────
 
@@ -319,45 +308,45 @@ class JEBEngine(EngineBase):
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         p.add_argument("--md-out", action="store_true", help="Markdown format output")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_summary)
+        p.set_defaults(func=_cmd('recon.cmd_summary'))
 
         p = subparsers.add_parser("permissions", help="List Android permissions")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_permissions)
+        p.set_defaults(func=_cmd('recon.cmd_permissions'))
 
         p = subparsers.add_parser("components", help="List Android components")
         p.add_argument("--type", choices=["activity", "service", "receiver", "provider"],
                         help="Filter by component type")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_components)
+        p.set_defaults(func=_cmd('recon.cmd_components'))
 
         p = subparsers.add_parser("info", help="Show APK metadata")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_info)
+        p.set_defaults(func=_cmd('recon.cmd_info'))
 
         p = subparsers.add_parser("main-activity", help="Show main activity class")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_main_activity)
+        p.set_defaults(func=_cmd('recon.cmd_main_activity'))
 
         p = subparsers.add_parser("app-class", help="Show Application class")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_app_class)
+        p.set_defaults(func=_cmd('recon.cmd_app_class'))
 
         p = subparsers.add_parser("resources", help="List APK resource files")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_resources)
+        p.set_defaults(func=_cmd('recon.cmd_resources'))
 
         p = subparsers.add_parser("resource", help="Get content of a resource file")
         p.add_argument("path", help="Resource path within APK")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_resource)
+        p.set_defaults(func=_cmd('recon.cmd_resource'))
 
         p = subparsers.add_parser("manifest", help="Show AndroidManifest.xml")
         p.add_argument("--component", metavar="NAME", help="Filter by component name or tag")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_manifest)
+        p.set_defaults(func=_cmd('recon.cmd_manifest'))
 
         # ── search — RPC proxy ───────────────────────────────
 
@@ -366,14 +355,14 @@ class JEBEngine(EngineBase):
         p.add_argument("--max", type=int, help="Max results")
         p.add_argument("--regex", action="store_true", help="Use regex matching")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_search_classes)
+        p.set_defaults(func=_cmd('search.cmd_search_classes'))
 
         p = subparsers.add_parser("search-methods", help="Search methods by name")
         p.add_argument("name", help="Method name to search")
         p.add_argument("--max", type=int, help="Max results")
         p.add_argument("--regex", action="store_true", help="Use regex matching")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_search_methods)
+        p.set_defaults(func=_cmd('search.cmd_search_methods'))
 
         p = subparsers.add_parser("search-code", help="Search within decompiled source")
         p.add_argument("query", help="Search query")
@@ -384,14 +373,14 @@ class JEBEngine(EngineBase):
         p.add_argument("--package", metavar="PKG", help="Filter by package")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_search_code)
+        p.set_defaults(func=_cmd('search.cmd_search_code'))
 
         p = subparsers.add_parser("strings-xrefs", help="List strings with cross-references")
         p.add_argument("--filter", metavar="PATTERN", help="Filter pattern")
         p.add_argument("--max", type=int, help="Max results")
         p.add_argument("--min-refs", type=int, help="Minimum reference count")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_strings_xrefs)
+        p.set_defaults(func=_cmd('search.cmd_strings_xrefs'))
 
         # ── modification — RPC proxy ─────────────────────────
 
@@ -400,58 +389,58 @@ class JEBEngine(EngineBase):
         p.add_argument("new_name", help="New name")
         p.add_argument("--preview", action="store_true", help="Preview impact without applying")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_rename)
+        p.set_defaults(func=_cmd('modification.cmd_rename'))
 
         p = subparsers.add_parser("rename-class", help="Rename a class")
         p.add_argument("class_sig", help="Class DEX signature")
         p.add_argument("new_name", help="New class name")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_rename_class)
+        p.set_defaults(func=_cmd('modification.cmd_rename_class'))
 
         p = subparsers.add_parser("rename-method", help="Rename a method")
         p.add_argument("method_sig", help="Method DEX signature")
         p.add_argument("new_name", help="New method name")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_rename_method)
+        p.set_defaults(func=_cmd('modification.cmd_rename_method'))
 
         p = subparsers.add_parser("rename-field", help="Rename a field")
         p.add_argument("field_sig", help="Field DEX signature")
         p.add_argument("new_name", help="New field name")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_rename_field)
+        p.set_defaults(func=_cmd('modification.cmd_rename_field'))
 
         p = subparsers.add_parser("rename-batch", help="Batch rename from JSON file")
         p.add_argument("--file", required=True, dest="json_file", help="JSON file with rename entries")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_rename_batch)
+        p.set_defaults(func=_cmd('modification.cmd_rename_batch'))
 
         p = subparsers.add_parser("rename-preview", help="Preview rename impact")
         p.add_argument("sig", help="DEX signature")
         p.add_argument("new_name", help="New name")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_rename_preview)
+        p.set_defaults(func=_cmd('modification.cmd_rename_preview'))
 
         p = subparsers.add_parser("auto-rename", help="Heuristic auto-rename obfuscated names")
         p.add_argument("--max-classes", type=int, default=100, help="Max classes to process")
         p.add_argument("--apply", action="store_true", help="Apply renames (default: preview)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_auto_rename)
+        p.set_defaults(func=_cmd('modification.cmd_auto_rename'))
 
         p = subparsers.add_parser("set-comment", help="Set comment at address/signature")
         p.add_argument("addr", help="Address or signature")
         p.add_argument("text", help="Comment text")
         p.add_argument("--type", metavar="TYPE", help="Comment type")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_set_comment)
+        p.set_defaults(func=_cmd('modification.cmd_set_comment'))
 
         p = subparsers.add_parser("get-comments", help="Get comments")
         p.add_argument("addr", nargs="?", help="Address (optional, all if omitted)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_get_comments)
+        p.set_defaults(func=_cmd('modification.cmd_get_comments'))
 
         p = subparsers.add_parser("undo", help="Undo last rename or comment")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_undo)
+        p.set_defaults(func=_cmd('modification.cmd_undo'))
 
         p = subparsers.add_parser("bookmark", help="Manage bookmarks")
         p.add_argument("--action", choices=["add", "list", "remove"], default="list",
@@ -459,7 +448,7 @@ class JEBEngine(EngineBase):
         p.add_argument("sig", nargs="?", help="DEX signature (for add/remove)")
         p.add_argument("--note", metavar="TEXT", help="Bookmark note (for add)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_bookmark)
+        p.set_defaults(func=_cmd('modification.cmd_bookmark'))
 
         # ── xrefs — RPC proxy ────────────────────────────────
 
@@ -468,17 +457,17 @@ class JEBEngine(EngineBase):
         p.add_argument("--direction", choices=["to", "from", "both"], default="to",
                         help="Xref direction (default: to)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_xrefs)
+        p.set_defaults(func=_cmd('xrefs.cmd_xrefs'))
 
         p = subparsers.add_parser("callers", help="Show who calls this (xrefs to)")
         p.add_argument("sig", help="DEX signature")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_callers)
+        p.set_defaults(func=_cmd('xrefs.cmd_callers'))
 
         p = subparsers.add_parser("callees", help="Show what this calls (xrefs from)")
         p.add_argument("sig", help="DEX signature")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_callees)
+        p.set_defaults(func=_cmd('xrefs.cmd_callees'))
 
         p = subparsers.add_parser("callgraph", help="Generate call graph")
         p.add_argument("class_sig", help="Class DEX signature")
@@ -489,7 +478,7 @@ class JEBEngine(EngineBase):
                         default="mermaid", help="Output format (default: mermaid)")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_callgraph)
+        p.set_defaults(func=_cmd('xrefs.cmd_callgraph'))
 
         p = subparsers.add_parser("cross-refs", help="Multi-level xref chain tracing")
         p.add_argument("sig", help="DEX signature")
@@ -497,19 +486,19 @@ class JEBEngine(EngineBase):
         p.add_argument("--direction", choices=["to", "from", "both"], default="to", help="Trace direction (default: to)")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_cross_refs)
+        p.set_defaults(func=_cmd('xrefs.cmd_cross_refs'))
 
         # ── report — mixed ───────────────────────────────────
 
         p = subparsers.add_parser("annotations-export", help="Export annotations to JSON")
         p.add_argument("--out", metavar="PATH", help="Output file (default: annotations.json)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_annotations_export)
+        p.set_defaults(func=_cmd('report.cmd_annotations_export'))
 
         p = subparsers.add_parser("annotations-import", help="Import annotations from JSON")
         p.add_argument("file", help="JSON file to import")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_annotations_import)
+        p.set_defaults(func=_cmd('report.cmd_annotations_import'))
 
         p = subparsers.add_parser("annotations", help="Export or import annotations")
         p.add_argument("--action", choices=["export", "import"], default="export",
@@ -517,21 +506,21 @@ class JEBEngine(EngineBase):
         p.add_argument("--out", metavar="PATH", help="Output file (for export)")
         p.add_argument("file", nargs="?", help="Input file (for import)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_annotations)
+        p.set_defaults(func=_cmd('report.cmd_annotations'))
 
         p = subparsers.add_parser("snapshot-save", help="Save project snapshot")
         p.add_argument("--description", metavar="TEXT", help="Snapshot description")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_snapshot_save)
+        p.set_defaults(func=_cmd('report.cmd_snapshot_save'))
 
         p = subparsers.add_parser("snapshot-list", help="List project snapshots")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_snapshot_list)
+        p.set_defaults(func=_cmd('report.cmd_snapshot_list'))
 
         p = subparsers.add_parser("snapshot-restore", help="Restore from snapshot")
         p.add_argument("filename", help="Snapshot filename")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_snapshot_restore)
+        p.set_defaults(func=_cmd('report.cmd_snapshot_restore'))
 
         p = subparsers.add_parser("snapshot", help="Manage snapshots")
         p.add_argument("--action", choices=["save", "list", "restore"], default="list",
@@ -539,58 +528,58 @@ class JEBEngine(EngineBase):
         p.add_argument("--description", metavar="TEXT", help="Description (for save)")
         p.add_argument("filename", nargs="?", help="Snapshot filename (for restore)")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_snapshot)
+        p.set_defaults(func=_cmd('report.cmd_snapshot'))
 
         p = subparsers.add_parser("report", help="Generate markdown analysis report")
         p.add_argument("--out", metavar="PATH", required=True, help="Output file path")
         p.add_argument("--decompile", nargs="*", metavar="SIG",
                         help="DEX signatures to include decompiled source")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_report)
+        p.set_defaults(func=_cmd('report.cmd_report'))
 
         # ── security — RPC proxy ─────────────────────────────
 
         p = subparsers.add_parser("entry-points", help="Analyze attack surface")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_entry_points)
+        p.set_defaults(func=_cmd('security.cmd_entry_points'))
 
         p = subparsers.add_parser("security-scan", help="Automated security issue detection")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_security_scan)
+        p.set_defaults(func=_cmd('security.cmd_security_scan'))
 
         # ── tooling — local (no _inject_common_options) ──────
 
         p = subparsers.add_parser("gen-runner", help="Generate JebScriptRunner.java")
         p.add_argument("--force", action="store_true", help="Regenerate even if up-to-date")
         p.add_argument("--no-compile", action="store_true", help="Skip compilation")
-        p.set_defaults(func=cmd_gen_runner)
+        p.set_defaults(func=_cmd('tooling.cmd_gen_runner'))
 
         p = subparsers.add_parser("patch", help="Patch jeb.jar for --script= support")
         p.add_argument("--status", action="store_true", help="Show patch status only")
         p.add_argument("--force", action="store_true", help="Force re-patch")
-        p.set_defaults(func=cmd_patch)
+        p.set_defaults(func=_cmd('tooling.cmd_patch'))
 
         p = subparsers.add_parser("unpatch", help="Restore original jeb.jar from backup")
-        p.set_defaults(func=cmd_unpatch)
+        p.set_defaults(func=_cmd('tooling.cmd_unpatch'))
 
         p = subparsers.add_parser("merge", help="Merge split APKs into single APK")
         p.add_argument("input", help="Input directory or XAPK/APKS file")
         p.add_argument("--out", metavar="PATH", help="Output APK path")
         p.add_argument("--start", action="store_true", help="Auto-start JEB analysis after merge")
         p.add_argument("--xmx", metavar="SIZE", help="JVM heap size for analysis")
-        p.set_defaults(func=cmd_merge)
+        p.set_defaults(func=_cmd('tooling.cmd_merge'))
 
         # ── config — local ───────────────────────────────────
 
         p = subparsers.add_parser("config-show", help="Display current configuration")
-        p.set_defaults(func=cmd_config_show)
+        p.set_defaults(func=_cmd('config.cmd_config_show'))
 
         p = subparsers.add_parser("config-set", help="Set a config value")
         p.add_argument("key", help="Config key (dot-separated, e.g. jeb.heap.default)")
         p.add_argument("value", help="New value")
-        p.set_defaults(func=cmd_config_set)
+        p.set_defaults(func=_cmd('config.cmd_config_set'))
 
         # ── batch ────────────────────────────────────────────
 
@@ -599,7 +588,7 @@ class JEBEngine(EngineBase):
         p.add_argument("--ext", default="apk", help="File extension to match (default: apk)")
         p.add_argument("--keep", action="store_true", help="Keep instances after analysis")
         p.add_argument("--timeout", type=int, default=300, help="Per-file timeout (default: 300s)")
-        p.set_defaults(func=cmd_batch)
+        p.set_defaults(func=_cmd('batch.cmd_batch'))
 
         # ── utility ──────────────────────────────────────────
 
@@ -607,13 +596,13 @@ class JEBEngine(EngineBase):
         p.add_argument("code", help="Inline code or .py path (short: security/check_webview.py)")
         p.add_argument("--out", metavar="PATH", help="Save output to file")
         self._inject_common_options(p)
-        p.set_defaults(func=cmd_exec)
+        p.set_defaults(func=_cmd('utility.cmd_exec'))
 
         p = subparsers.add_parser("completion", help="Generate shell completion script")
         p.add_argument("--shell", choices=["bash", "zsh"], default="bash",
                         help="Shell type (default: bash)")
         p.add_argument("--out", metavar="PATH", help="Save to file")
-        p.set_defaults(func=cmd_completion)
+        p.set_defaults(func=_cmd('utility.cmd_completion'))
 
     def validate_installation(self) -> bool:
         jeb_cfg = self._find_jeb_config()

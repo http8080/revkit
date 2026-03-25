@@ -670,9 +670,19 @@ class JebServer(IScript):
         return result
 
     def _handle_stop(self, params):
-        """Shut down server (save project, release latch)"""
+        """Shut down server (save project, clean registry, release latch)"""
         try:
             self.engctx.saveProject(self.prj.getKey(), self.project_path, None, None)
+        except Exception:
+            pass
+        # Clean up registry and auth token BEFORE shutdown
+        # (CLI checks registry/process to confirm stop)
+        try:
+            self._remove_from_registry(self.instance_id)
+        except Exception:
+            pass
+        try:
+            self._remove_auth_token(self.instance_id)
         except Exception:
             pass
         # Delay latch release so HTTP response can be sent first

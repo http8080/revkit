@@ -132,6 +132,23 @@ def cmd_check(ctx: CmdContext):
         if java_home or jvm_opts:
             print(f"  Note:  java_home/jvm_opts ignored in bat mode (uses jvmopt.txt)")
 
+    # Java server JAR check
+    server_jar = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "server", "java", "revkit-jeb-server.jar")
+    if os.path.isfile(server_jar):
+        jar_size = os.path.getsize(server_jar) // 1024
+        jar_mtime = os.path.getmtime(server_jar)
+        import datetime
+        jar_date = datetime.datetime.fromtimestamp(jar_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"  Java server: {jar_size}KB (built {jar_date})")
+    else:
+        print(f"  Java server: NOT FOUND (run: jeb gen-runner)")
+        issues.append("revkit-jeb-server.jar not found")
+
+    server_type = config.get("jeb", {}).get("server_type", "java")
+    print(f"  Server type: {server_type}")
+
     for mod_name, mod in [("requests", None), ("psutil", psutil)]:
         try:
             if mod is None:
@@ -269,17 +286,26 @@ def cmd_stop(ctx: CmdContext):
     if port:
         try:
             post_rpc(config, port, "stop", iid, timeout=STOP_RPC_TIMEOUT)
+            # Wait for process to exit (Java server cleans registry in stop handler)
+            from ....core.instance import is_process_alive
             for _ in range(STOP_WAIT_ITERATIONS):
                 time.sleep(STOP_POLL_INTERVAL)
+                if pid and not is_process_alive(pid):
+                    _cleanup_instance(config, iid)
+                    _log_ok(f"Instance {iid} stopped normally")
+                    return
                 if iid not in load_registry():
+                    _cleanup_instance(config, iid)
                     _log_ok(f"Instance {iid} stopped normally")
                     return
         except Exception as _e:
             log.warning("cmd_stop: graceful RPC stop failed for %s: %s", iid, _e)
 
-    # Force kill
+    # Force kill if still alive
     if pid:
-        _force_kill(iid, pid, info.get("pid_create_time"))
+        from ....core.instance import is_process_alive
+        if is_process_alive(pid):
+            _force_kill(iid, pid, info.get("pid_create_time"))
 
     # Clean up registry and auth token
     _cleanup_instance(config, iid)
@@ -592,7 +618,8 @@ def cmd_save(ctx: CmdContext):
     """Save the current JEB project database."""
     args, config = ctx.args, ctx.config
     log.debug("cmd_save: saving project")
-    r = _rpc_call(args, config, "save_project")
+    # Large projects (1GB+) can take minutes to save — use 10 min timeout
+    r = _rpc_call(args, config, "save_project", timeout=600)
     if r:
         log.debug("cmd_save: saved to %s", r.get('project_path', ''))
         _log_ok(f"Project saved: {r.get('project_path', '')}")

@@ -286,7 +286,22 @@ def cmd_get_comments(ctx: CmdContext):
 def cmd_undo(ctx: CmdContext):
     """#36: Undo the last rename or comment operation."""
     args, config = ctx.args, ctx.config
-    log.debug("cmd_undo: popping last undo entry")
+    log.debug("cmd_undo: trying server-side undo first")
+    # Try server-side undo first (has history from rename_class, set_comment, etc.)
+    r = _rpc_call(args, config, "undo")
+    if r and r.get("ok"):
+        action = r.get("action", "")
+        reverted = r.get("reverted", "")
+        addr = r.get("addr", "")
+        if "rename" in action:
+            _log_ok(f"Undone rename: {reverted}")
+        elif "comment" in action:
+            _log_ok(f"Undone comment at {addr}")
+        else:
+            _log_ok(f"Undone: {action}")
+        return
+    # Fallback to client-side undo history
+    log.debug("cmd_undo: server undo failed, trying client-side")
     entry = _pop_undo()
     if not entry:
         _log_info("No undo history available")
@@ -294,19 +309,18 @@ def cmd_undo(ctx: CmdContext):
     action = entry["type"]
     data = entry["data"]
     if action == "rename":
-        # Reverse: rename new_name back to old_name
         sig = data.get("sig")
         old_name = data.get("old_name")
         rpc = data.get("rpc", "rename_class")
-        r = _rpc_call(args, config, rpc, {"sig": sig, "new_name": old_name})
-        if r:
+        r2 = _rpc_call(args, config, rpc, {"sig": sig, "new_name": old_name})
+        if r2:
             _log_ok(f"Undone rename: {data.get('new_name', '')} -> {old_name}")
     elif action == "comment":
         addr = data.get("addr")
         old_comment = data.get("old_comment", "")
-        r = _rpc_call(args, config, "set_comment",
-                      {"address": addr, "comment": old_comment})
-        if r:
+        r2 = _rpc_call(args, config, "set_comment",
+                       {"address": addr, "comment": old_comment})
+        if r2:
             _log_ok(f"Undone comment at {addr}")
     else:
         _log_err(f"Unknown undo action: {action}")

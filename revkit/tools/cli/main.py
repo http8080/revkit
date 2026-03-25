@@ -383,10 +383,10 @@ def _run_remote(args, gateway_url: str) -> int:
                     except Exception as e:
                         log_err(f"Cannot read annotations file: {fpath}: {e}")
                         return 1
-            # Same for IDA annotations with input_file
-            if command == "annotations" and "input_file" in params:
+            # Annotations import: read file content (IDA uses "input_file", JEB uses "file")
+            if command in ("annotations", "annotations-import"):
                 import json as _json
-                fpath = params.pop("input_file")
+                fpath = params.pop("input_file", None) or params.pop("file", None)
                 if fpath and os.path.isfile(fpath):
                     try:
                         with open(fpath, encoding="utf-8") as fp:

@@ -6,20 +6,109 @@ RPC proxy forwards JSON-RPC to engine servers with Host header rewriting.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
 from .upload import UploadError, parse_multipart
 
 log = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────
+# Response cache for read-only RPC methods (Optimization #20)
+# ──────────────────────────────────────────────────────────
+
+_CACHEABLE_METHODS = frozenset({
+    "ping", "status", "get_classes", "get_class_source", "get_methods_of_class",
+    "search_classes", "search_methods", "get_strings", "native_methods",
+    "info", "summary", "get_manifest", "get_main_activity", "get_app_classes",
+    "get_fields_of_class", "get_method_info", "get_smali", "get_xrefs_to",
+    "get_xrefs_from", "methods",
+})
+
+_CACHE_TTL = 30  # seconds
+_CACHE_MAX_SIZE = 128
+_rpc_cache: OrderedDict[tuple, tuple[bytes, float]] = OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def _cache_key(instance_id: str, method: str, body: bytes) -> tuple:
+    """Create a hashable cache key from instance, method, and request body."""
+    body_hash = hashlib.md5(body).hexdigest()
+    return (instance_id, method, body_hash)
+
+
+def _cache_get(key: tuple) -> bytes | None:
+    """Get cached response if still valid."""
+    with _cache_lock:
+        entry = _rpc_cache.get(key)
+        if entry is None:
+            return None
+        resp_body, ts = entry
+        if time.time() - ts > _CACHE_TTL:
+            _rpc_cache.pop(key, None)
+            return None
+        # Move to end (most recently used)
+        _rpc_cache.move_to_end(key)
+        return resp_body
+
+
+def _cache_put(key: tuple, resp_body: bytes) -> None:
+    """Store response in cache, evicting oldest if full."""
+    with _cache_lock:
+        _rpc_cache[key] = (resp_body, time.time())
+        _rpc_cache.move_to_end(key)
+        while len(_rpc_cache) > _CACHE_MAX_SIZE:
+            _rpc_cache.popitem(last=False)
+
+
+# ──────────────────────────────────────────────────────────
+# Registry TTL cache — avoid disk I/O + lock on every request
+# ──────────────────────────────────────────────────────────
+
+_REGISTRY_CACHE_TTL = 5  # seconds
+_registry_cache: dict[str, tuple[list[dict], float]] = {}
+_registry_cache_lock = threading.Lock()
+
+
+def _cached_registry(engine_name: str) -> list[dict]:
+    """Load registry entries with TTL cache (5s). Falls back to cleanup_stale."""
+    from ..core.registry import get_registry_path, cleanup_stale
+
+    with _registry_cache_lock:
+        cached = _registry_cache.get(engine_name)
+        if cached:
+            entries, ts = cached
+            if time.time() - ts < _REGISTRY_CACHE_TTL:
+                return entries
+
+    # Cache miss or expired — do real I/O outside lock
+    reg_path = get_registry_path(engine_name)
+    entries = cleanup_stale(reg_path)
+
+    with _registry_cache_lock:
+        _registry_cache[engine_name] = (entries, time.time())
+    return entries
+
+
+def _invalidate_registry_cache(engine_name: str | None = None) -> None:
+    """Invalidate registry cache after mutations (start/stop/delete)."""
+    with _registry_cache_lock:
+        if engine_name:
+            _registry_cache.pop(engine_name, None)
+        else:
+            _registry_cache.clear()
+
 
 ROUTE_PATTERNS: list[tuple[str, str, str]] = [
     ("GET",    r"^/api/v1/health$",                      "handle_health"),
@@ -96,12 +185,9 @@ def handle_list_instances(
     handler: BaseHTTPRequestHandler, gw_config: dict, match: re.Match
 ) -> None:
     """GET /api/v1/instances — List all engine instances from registry."""
-    from ..core.registry import get_registry_path, load_registry, cleanup_stale
-
     instances = []
     for engine_name in ("ida", "jeb"):
-        reg_path = get_registry_path(engine_name)
-        entries = cleanup_stale(reg_path)
+        entries = _cached_registry(engine_name)
         for entry in entries:
             # L17: copy to avoid mutating registry in-memory
             instances.append({**entry, "engine": engine_name})
@@ -157,12 +243,30 @@ def handle_rpc_proxy(
         _send_json(handler, 403, {"error": "exec is disabled on gateway (set gateway.exec_enabled=true)"})
         return
 
+    # Optimization #20: check response cache for read-only methods
+    is_cacheable = rpc_method_name in _CACHEABLE_METHODS
+    cache_k = None
+    if is_cacheable:
+        cache_k = _cache_key(instance_id, rpc_method_name, body)
+        cached = _cache_get(cache_k)
+        if cached is not None:
+            log.debug("handle_rpc_proxy: cache hit for %s/%s", instance_id, rpc_method_name)
+            handler._response_status = 200
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(cached)))
+            handler.send_header("X-Cache", "HIT")
+            handler.end_headers()
+            handler.wfile.write(cached)
+            return
+
     target_url = f"http://127.0.0.1:{port}/"
 
     headers = {
         "Content-Type": "application/json",
         "Host": f"127.0.0.1:{port}",
         "X-Forwarded-Host": handler.headers.get("Host", ""),
+        "Connection": "keep-alive",
     }
     # H4: resolve auth token from registry or auth_tokens.json
     auth_token = _resolve_auth_token(instance_id, instance, gw_config)
@@ -178,8 +282,13 @@ def handle_rpc_proxy(
             handler.send_response(resp.status)
             handler.send_header("Content-Type", "application/json")
             handler.send_header("Content-Length", str(len(resp_body)))
+            if is_cacheable:
+                handler.send_header("X-Cache", "MISS")
             handler.end_headers()
             handler.wfile.write(resp_body)
+            # Optimization #20: cache successful read-only responses
+            if is_cacheable and cache_k and resp.status == 200:
+                _cache_put(cache_k, resp_body)
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         log.warning("handle_rpc_proxy: HTTP error %d from %s: %s", e.code, target_url, error_body[:200])
@@ -229,6 +338,7 @@ def handle_delete_instance(
     for engine_name in ("ida", "jeb"):
         reg_path = get_registry_path(engine_name)
         if unregister_instance(reg_path, instance_id):
+            _invalidate_registry_cache(engine_name)
             _send_json(handler, 200, {"deleted": instance_id})
             return
 
@@ -298,6 +408,7 @@ def handle_start_engine(
             # M14: cleanup uploaded file after successful start
             from .upload import cleanup_upload
             cleanup_upload(file_id, gw_config)
+            _invalidate_registry_cache(engine_name)
             _send_json(handler, 200, {
                 "instance_id": instance_id,
                 "engine": engine_name,
@@ -375,12 +486,11 @@ def handle_gateway_info(
     handler: BaseHTTPRequestHandler, gw_config: dict, match: re.Match
 ) -> None:
     """GET /api/v1/gateway/info — Gateway status + uptime + instance count."""
-    from ..core.registry import get_registry_path, cleanup_stale
     import platform
 
     instances = {}
     for eng in ("ida", "jeb"):
-        entries = cleanup_stale(get_registry_path(eng))
+        entries = _cached_registry(eng)
         instances[eng] = len(entries)
 
     _send_json(handler, 200, {
@@ -472,12 +582,10 @@ def handle_stop_all(
     handler: BaseHTTPRequestHandler, gw_config: dict, match: re.Match
 ) -> None:
     """POST /api/v1/gateway/stop-all — Stop all engine instances."""
-    from ..core.registry import get_registry_path, cleanup_stale
-
     stopped = []
     failed = []
     for eng in ("ida", "jeb"):
-        entries = cleanup_stale(get_registry_path(eng))
+        entries = _cached_registry(eng)
         for entry in entries:
             iid = entry.get("id", "")
             try:
@@ -510,6 +618,7 @@ def handle_stop_all(
             else:
                 stopped.append(iid)
 
+    _invalidate_registry_cache()
     _send_json(handler, 200, {
         "stopped": stopped,
         "failed": failed,
@@ -681,14 +790,15 @@ def handle_gateway_cleanup(
     handler: BaseHTTPRequestHandler, gw_config: dict, match: re.Match
 ) -> None:
     """POST /api/v1/gateway/cleanup — Clean stale registry + zombie processes."""
-    from ..core.registry import get_registry_path, cleanup_stale
+    from ..core.registry import get_registry_path, load_registry, cleanup_stale
 
     result = {}
     for eng in ("ida", "jeb"):
         reg_path = get_registry_path(eng)
-        before = len(cleanup_stale(reg_path))
+        before_count = len(load_registry(reg_path))
         entries = cleanup_stale(reg_path)
-        result[eng] = {"active": len(entries), "cleaned": before - len(entries)}
+        result[eng] = {"active": len(entries), "cleaned": before_count - len(entries)}
+        _invalidate_registry_cache(eng)
 
     _send_json(handler, 200, result)
 
@@ -904,12 +1014,9 @@ def handle_instance_progress(
 
 
 def _find_instance(instance_id: str) -> dict | None:
-    """Look up instance across all engine registries. L10: uses cleanup_stale."""
-    from ..core.registry import get_registry_path, cleanup_stale
-
+    """Look up instance across all engine registries. Uses TTL cache."""
     for engine_name in ("ida", "jeb"):
-        reg_path = get_registry_path(engine_name)
-        entries = cleanup_stale(reg_path)
+        entries = _cached_registry(engine_name)
         for entry in entries:
             if entry.get("id") == instance_id:
                 return entry
@@ -951,7 +1058,10 @@ def _rpc_to_instance(instance: dict, method: str, params: dict | None = None,
         "jsonrpc": "2.0", "method": method,
         "params": params or {}, "id": 1,
     }).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+    }
     auth_token = _resolve_auth_token(iid, instance, gw_config or {})
     if auth_token:
         headers["Authorization"] = f"Bearer {auth_token}"

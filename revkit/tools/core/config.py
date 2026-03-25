@@ -30,6 +30,9 @@ def _expand_env(value: str) -> str:
 def _expand_config(obj):
     """Recursively expand environment variables in all string values."""
     if isinstance(obj, str):
+        # Fast path: skip expansion for strings without variables
+        if '~' not in obj and '$' not in obj and '%' not in obj:
+            return obj
         return _expand_env(obj)
     if isinstance(obj, dict):
         return {k: _expand_config(v) for k, v in obj.items()}

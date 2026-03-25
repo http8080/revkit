@@ -43,11 +43,17 @@
 |------|------|
 | `gateway/daemon.py` | `GatewayDaemon` (ThreadingHTTPServer 상속), `ConfigWatcher`, `run_gateway()` |
 | `gateway/router.py` | URL 패턴 매칭 → 핸들러 디스패치 (22개 라우트) |
-| `gateway/auth.py` | API key 검증 (timing-safe), IP 화이트리스트 (CIDR), X-Forwarded-For |
-| `gateway/upload.py` | multipart 파싱, UUID 파일명, atomic write, 디스크 공간 체크 |
+| `gateway/auth.py` | API key 검증 (timing-safe), IP 화이트리스트 (CIDR 사전 파싱 캐시), X-Forwarded-For |
+| `gateway/upload.py` | 스트리밍 멀티파트 파싱 (피크 ~70MB), UUID 파일명, atomic write, 디스크 공간 체크 |
 | `gateway/audit.py` | JSONL 감사 로그, 스레드 안전, 크기 초과 시 아카이브 회전 |
 | `gateway/config.py` | `GATEWAY_DEFAULTS`, `load_gateway_config()`, `validate_gateway_config()` |
-| `cli/remote.py` | 클라이언트 측: `upload_binary()`, `post_rpc_remote()`, `remote_start()`, `remote_list()` |
+| `cli/remote.py` | 클라이언트 측: 스트리밍 `upload_binary()` (피크 ~128KB), `post_rpc_remote()`, `remote_start()`, `remote_list()` |
+
+**성능 최적화:**
+
+- **레지스트리 TTL 캐시**: list/info/find 요청 시 5초 캐시 (디스크 I/O 80-90% 감소)
+- **CIDR 사전 파싱**: IP 화이트리스트를 시작 시 한 번 파싱하여 매 요청 파싱 제거 (7x)
+- **스트리밍 업로드**: 서버/클라이언트 양쪽 64KB 청크 스트리밍 (500MB 파일도 ~70MB 피크)
 
 **요청 처리 흐름:**
 

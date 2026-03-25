@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
-DEFAULT_TIMEOUT = 60
+DEFAULT_TIMEOUT = 600
 DEFAULT_BATCH_TIMEOUT = 300
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_DELAY = 1.0
@@ -135,9 +135,10 @@ def post_rpc(
             if "timed out" in str(e).lower():
                 raise RpcError("TIMEOUT", f"Request timeout ({timeout}s)")
             if attempt < retries - 1:
+                delay = min(retry_delay * (2 ** attempt), 10.0)
                 log.debug("RPC %s attempt %d/%d failed: %s, retrying in %.1fs",
-                          method, attempt + 1, retries, e, retry_delay)
-                time.sleep(retry_delay)
+                          method, attempt + 1, retries, e, delay)
+                time.sleep(delay)
                 continue
 
     if on_connection_failed:

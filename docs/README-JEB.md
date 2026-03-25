@@ -29,9 +29,9 @@ JEB Pro 엔진 명령어, RPC 메서드, 설정에 대한 상세 문서.
 
 ## Overview / 개요
 
-The JEB engine provides headless APK/DEX/JAR analysis through JEB Pro's Jython API.
+The JEB engine provides headless APK/DEX/JAR analysis through JEB Pro's Java API.
 
-JEB 엔진은 JEB Pro의 Jython API를 통해 APK/DEX/JAR 의 headless 분석을 제공한다.
+JEB 엔진은 JEB Pro의 Java API를 통해 APK/DEX/JAR 의 headless 분석을 제공한다.
 
 | Feature | Value |
 | ------- | ----- |
@@ -39,7 +39,7 @@ JEB 엔진은 JEB Pro의 Jython API를 통해 APK/DEX/JAR 의 headless 분석을
 | DB extension / DB 확장자 | `.jdb2` |
 | Identifier / 식별자 | DEX signature (`Lcom/example/Foo;`) |
 | Instance ID / 인스턴스 ID | `{name}_{4hex}` (`app-a3f2`) |
-| Server runtime / 서버 런타임 | Jython 2.7 |
+| Server runtime / 서버 런타임 | Java 11+ (revkit-jeb-server.jar) |
 | Command modules / 명령어 모듈 | 13 |
 | Total commands / 전체 명령어 | 72 |
 
@@ -55,7 +55,7 @@ revkit jeb <command> [options]
   cmd_*() ──── HTTP POST ──── JEB Server (JSON-RPC)
        │                             │
        ▼                             ▼
-  CLI output / file save        Jython API (JEB Core)
+  CLI output / file save        Java API (JEB Core)
 ```
 
 ### DEX Signature Format / DEX 시그니처 형식
@@ -74,24 +74,16 @@ Field:  Lcom/example/MainActivity;->mFlag:Z
 >
 > 짧은 이름 자동 해석 지원: `MainActivity` → `Lcom/example/MainActivity;`
 
-### Jython 2.7 제약사항 (중요)
+### Server Architecture / 서버 아키텍처
 
-JEB 서버 코드(`revkit/tools/engines/jeb/server/`)는 **Jython 2.7** 환경에서 실행된다.
-Python 3 문법을 사용하면 JEB 서버가 시작과 동시에 SyntaxError로 죽는다.
+JEB 서버는 **Java로 구현**되어 JEB Pro API를 직접 호출한다 (`revkit-jeb-server.jar`).
 
-**금지 문법:**
+- **현재**: Java 서버 (`server/java/`) — 네이티브 JEB API, 고성능
+- **레거시**: Jython 서버 (`server/legacy/`) — 롤백용 보존, 삭제하지 않음
 
-| Python 3 문법 | Jython 2.7 대체 |
-|---|---|
-| `print(..., flush=True)` | `print(...); sys.stdout.flush()` |
-| `f"string {var}"` | `"string %s" % var` |
-| `x := expr` (walrus) | `x = expr` (별도 줄) |
-| `def fn(x: int) -> str:` (type hint) | `def fn(x):` |
-| `{**dict1, **dict2}` | `dict1.copy(); d.update(dict2)` |
-| `raise X from Y` | `raise X` |
+빌드: `revkit jeb gen-runner` (JebScriptRunner + Java 서버 JAR 자동 빌드)
 
-**주의:** `server/` 디렉토리 안의 모든 `.py` 파일은 Jython 2.7 문법만 허용.
-CLI 코드(`commands/`, `engine.py`, `core.py`)는 Python 3.10+ 사용 가능.
+상태 확인: `revkit jeb check` (Java 서버 JAR 크기/날짜/server_type 표시)
 
 ### JEB 서버 레지스트리 형식
 
@@ -118,6 +110,7 @@ CLI 코드(`commands/`, `engine.py`, `core.py`)는 Python 3.10+ 사용 가능.
     "jeb": {
         "install_dir": "/opt/jeb",
         "registry": "~/.revkit/jeb/registry.json",
+        "server_type": "java",
         "spawn_method": "wrapper",
         "java_home": "/usr/lib/jvm/java-17",
         "jvm_opts": ["-XX:+UseG1GC", "-Dfile.encoding=UTF-8"],
@@ -135,10 +128,10 @@ CLI 코드(`commands/`, `engine.py`, `core.py`)는 Python 3.10+ 사용 가능.
 | --- | ------------------ | ------- |
 | `jeb.install_dir` | JEB Pro installation directory / 설치 경로 | (required) |
 | `jeb.registry` | JEB instance registry path / JEB 레지스트리 경로 | `~/.revkit/jeb/registry.json` |
-| `jeb.registry` | JEB instance registry path / JEB 레지스트리 경로 | `~/.revkit/jeb/registry.json` |
-| `jeb.spawn_method` | Launch method: `wrapper` or `bat` / 실행 방식 | `wrapper` |
-| `jeb.java_home` | **wrapper only.** Java home override / Java 홈 오버라이드. bat 모드에서는 무시됨. | System default |
-| `jeb.jvm_opts` | **wrapper only.** Additional JVM args / 추가 JVM 인자. bat 모드에서는 무시됨 (jvmopt.txt 사용). | `[]` |
+| `jeb.server_type` | Server implementation: `java` or `jython` / 서버 구현체 | `jython` |
+| `jeb.spawn_method` | Launch method: `wrapper` or `bat` (jython only) / 실행 방식 (jython 전용) | `wrapper` |
+| `jeb.java_home` | Java home override / Java 홈 오버라이드. bat 모드에서는 무시됨. | System default |
+| `jeb.jvm_opts` | Additional JVM args / 추가 JVM 인자. bat 모드에서는 무시됨 (jvmopt.txt 사용). | `[]` |
 | `jeb.heap.auto` | Auto heap sizing based on RAM / RAM 기반 자동 힙 | `true` |
 | `jeb.heap.default` | Default heap size / 기본 힙 크기 | `4G` |
 | `jeb.heap.max` | Maximum heap size / 최대 힙 크기 | `16G` |
@@ -157,22 +150,27 @@ revkit jeb check
 
 ### Spawn Methods / 실행 방식
 
+Server type is selected by `jeb.server_type`. Spawn method (`jeb.spawn_method`) only applies when `server_type` is `jython`.
+
+서버 유형은 `jeb.server_type`으로 선택. `jeb.spawn_method`는 `server_type`이 `jython`일 때만 적용.
+
 | Method | Description / 설명 |
 | ------ | ------------------ |
-| `wrapper` | Direct JebScriptRunner execution via `java` command. Uses `java_home` and `jvm_opts` from config. **Works on all platforms.** / `java` 명령으로 JebScriptRunner 직접 실행. config의 `java_home`과 `jvm_opts` 사용. **모든 플랫폼 지원.** |
+| `java` | **Recommended.** Pure Java RPC server (`revkit-jeb-server.jar`). No Jython overhead, faster startup, better stability. Set `server_type: "java"`. Uses `java_home` and `jvm_opts`. / **권장.** 순수 Java RPC 서버. Jython 오버헤드 없음, 빠른 시작, 높은 안정성. `server_type: "java"` 설정. `java_home`과 `jvm_opts` 사용. |
+| `wrapper` | Jython-based JebScriptRunner execution via `java` command. Uses `java_home` and `jvm_opts` from config. **Works on all platforms.** / Jython 기반 JebScriptRunner 직접 실행. config의 `java_home`과 `jvm_opts` 사용. **모든 플랫폼 지원.** |
 | `bat` | Uses JEB's batch launcher (`jeb_wincon.bat`). Requires `patch` first. Ignores `java_home`/`jvm_opts` (reads `jvmopt.txt`). **Windows only.** / JEB 배치 런처 사용. `patch` 선행 필요. `java_home`/`jvm_opts` 무시. **Windows 전용.** |
 
 > **Platform availability / 플랫폼별 지원:**
 >
-> | Platform | `wrapper` | `bat` |
-> | --- | --- | --- |
-> | Windows | ✅ | ✅ (requires `patch`) |
-> | Linux | ✅ | ❌ (`jeb_wincon.bat` 없음) |
-> | macOS | ✅ | ❌ |
+> | Platform | `java` | `wrapper` | `bat` |
+> | --- | --- | --- | --- |
+> | Windows | ✅ | ✅ | ✅ (requires `patch`) |
+> | Linux | ✅ | ✅ | ❌ (`jeb_wincon.bat` 없음) |
+> | macOS | ✅ | ✅ | ❌ |
 
-> The active `spawn_method` is logged in CLI output, lifecycle JSONL logs (`instance.start` event), and debug logs for every spawn path (`start`, `restart`, `batch`).
+> The active server type / spawn method is logged in CLI output, lifecycle JSONL logs (`instance.start` event), and debug logs for every spawn path (`start`, `restart`, `batch`).
 >
-> 활성 `spawn_method`는 CLI 출력, 라이프사이클 JSONL 로그 (`instance.start` 이벤트), 그리고 모든 스폰 경로(`start`, `restart`, `batch`)의 디버그 로그에 기록된다.
+> 활성 서버 유형 / `spawn_method`는 CLI 출력, 라이프사이클 JSONL 로그 (`instance.start` 이벤트), 그리고 모든 스폰 경로(`start`, `restart`, `batch`)의 디버그 로그에 기록된다.
 
 ---
 
@@ -1102,6 +1100,7 @@ JEB 서버에서 사용 가능한 전체 JSON-RPC 메서드 목록.
     "jeb": {
         "install_dir": "C:/WorkSpace/bin/JEB-5.38",              // Linux: "~/JEB-5.38"
         "registry": "~/.revkit/jeb/registry.json",
+        "server_type": "java",
         "spawn_method": "wrapper",
         "java_home": "C:/Program Files/Java/jdk-21.0.10",        // Linux: "/usr/lib/jvm/java-21"
         "jvm_opts": ["-XX:+UseG1GC", "-Dfile.encoding=UTF-8"],
@@ -1146,9 +1145,10 @@ JEB 서버에서 사용 가능한 전체 JSON-RPC 메서드 목록.
 | ------- | --- | ------------------ | ------- |
 | `jeb` | `install_dir` | JEB installation / 설치 경로 | (required) |
 | `jeb` | `registry` | JEB instance registry / JEB 레지스트리 | `~/.revkit/jeb/registry.json` |
-| `jeb` | `spawn_method` | `wrapper` or `bat` | `wrapper` |
-| `jeb` | `java_home` | **wrapper only.** Java home / Java 홈 | System default |
-| `jeb` | `jvm_opts` | **wrapper only.** JVM args / JVM 인자 | `[]` |
+| `jeb` | `server_type` | `java` or `jython` | `jython` |
+| `jeb` | `spawn_method` | `wrapper` or `bat` (jython only) | `wrapper` |
+| `jeb` | `java_home` | Java home / Java 홈 | System default |
+| `jeb` | `jvm_opts` | JVM args / JVM 인자 | `[]` |
 | `jeb.heap` | `auto` | Auto heap sizing / 자동 힙 | `true` |
 | `jeb.heap` | `default` | Default heap / 기본 힙 | `4G` |
 | `jeb.heap` | `max` | Max heap / 최대 힙 | `16G` |

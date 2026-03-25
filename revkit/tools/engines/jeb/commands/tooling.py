@@ -135,10 +135,18 @@ public class JebScriptRunner {{
 def _find_runner_class(jeb_dir, config):
     """Scan jeb.jar for the HeadlessClientContext script runner class.
 
+    Detection strategy (5 levels, each progressively broader):
+      Level 1: Top-level classes + extends HeadlessClientContext + constructor (fast)
+      Level 2: ALL classes with HeadlessClientContext in bytecode (no name/location limits)
+      Level 3: Relaxed constructor check (extends HeadlessClientContext only)
+      Level 4: IClientContext inheritance chain walking (bytecode-based, no class name dependency)
+      Level 5: Pure behavioral — ctor(boolean,String,String,String[]) + start() (no name dependency at all)
+
     Returns (class_short_name, jeb_version_string) or (None, None).
     """
     import subprocess as sp
     import re
+    import zipfile
 
     jar_path = os.path.join(jeb_dir, "bin", "app", "jeb.jar")
     if not os.path.isfile(jar_path):
@@ -147,8 +155,9 @@ def _find_runner_class(jeb_dir, config):
 
     _, _, jar_bin, javap_bin = _java_tools(config)
 
-    # Step 1: list classes in com/pnfsoftware/jeb/ (top-level only, short names)
     _log_info("Scanning jeb.jar for script runner class...")
+
+    # ── Step 1: jar tf to list all classes ──
     try:
         out = sp.check_output([jar_bin, "tf", jar_path],
                               stderr=sp.DEVNULL, text=True, timeout=30)
@@ -160,8 +169,9 @@ def _find_runner_class(jeb_dir, config):
         _log_err(f"jar tf failed: {e}")
         return None, None
 
-    # Candidates: com/pnfsoftware/jeb/XX.class where XX is 1-3 chars (obfuscated)
-    candidates = []
+    # ── Level 1: Top-level candidates (no name length limit) ──
+    # Any class directly in com/pnfsoftware/jeb/ (not in subpackages)
+    level1_candidates = []
     for line in out.splitlines():
         line = line.strip()
         if not line.startswith("com/pnfsoftware/jeb/"):
@@ -171,47 +181,97 @@ def _find_runner_class(jeb_dir, config):
         if not line.endswith(".class"):
             continue
         name = line.rsplit("/", 1)[1].replace(".class", "")
-        if len(name) <= 3 and not name.startswith("$"):
-            candidates.append(name)
+        if not name.startswith("$"):
+            level1_candidates.append(name)
 
-    if not candidates:
-        _log_err("No short-named candidate classes found in com.pnfsoftware.jeb")
-        return None, None
+    _log_info(f"Level 1: {len(level1_candidates)} top-level candidates: "
+              f"{', '.join(sorted(level1_candidates))}")
 
-    _log_info(f"Found {len(candidates)} candidates: {', '.join(sorted(candidates))}")
-
-    # Step 2: javap each candidate to find HeadlessClientContext subclass
     cp = jar_path
-    found = None
-    for name in sorted(candidates):
-        fqn = f"com.pnfsoftware.jeb.{name}"
-        try:
-            jout = sp.check_output(
-                [javap_bin, "-cp", cp, "-public", fqn],
-                stderr=sp.DEVNULL, text=True, timeout=15)
-        except Exception:
-            continue
+    extends_pattern = "extends com.pnfsoftware.jeb.client.HeadlessClientContext"
+    ctor_pattern = re.compile(
+        r"(boolean,\s*java\.lang\.String,\s*java\.lang\.String,"
+        r"\s*java\.lang\.String\[\])")
 
-        # Check: extends HeadlessClientContext AND has (boolean, String, String, String[])
-        if "HeadlessClientContext" not in jout:
-            continue
-        if re.search(r"(boolean,\s*java\.lang\.String,\s*java\.lang\.String,\s*java\.lang\.String\[\])", jout):
-            found = name
-            _log_ok(f"Found script runner class: {fqn}")
-            break
+    # Try Level 1 candidates first (fast path)
+    found = _check_candidates_javap(
+        level1_candidates, "com.pnfsoftware.jeb",
+        javap_bin, cp, extends_pattern, ctor_pattern)
+
+    # ── Level 2: Bytecode scan (no name/location limits) ──
+    if not found:
+        _log_info("Level 1 failed. Scanning bytecode for HeadlessClientContext references...")
+        level2_candidates = []
+        try:
+            with zipfile.ZipFile(jar_path, "r") as zf:
+                target = b"HeadlessClientContext"
+                for entry in zf.namelist():
+                    if not entry.endswith(".class") or "$" in entry:
+                        continue
+                    # Skip classes already checked in Level 1
+                    if entry.count("/") == 3 and entry.startswith("com/pnfsoftware/jeb/"):
+                        continue
+                    data = zf.read(entry)
+                    if target in data:
+                        fqn = entry.replace("/", ".").replace(".class", "")
+                        level2_candidates.append(fqn)
+        except Exception as e:
+            _log_warn(f"Bytecode scan failed: {e}")
+
+        if level2_candidates:
+            _log_info(f"Level 2: {len(level2_candidates)} bytecode candidates")
+            found = _check_candidates_javap(
+                level2_candidates, None,  # FQN already complete
+                javap_bin, cp, extends_pattern, ctor_pattern)
+
+    # ── Level 3: Relaxed check (extends only, no constructor requirement) ──
+    if not found:
+        _log_info("Level 2 failed. Trying relaxed check (extends only)...")
+        all_candidates = [f"com.pnfsoftware.jeb.{n}" for n in level1_candidates]
+        all_candidates.extend(
+            [c for c in (level2_candidates if 'level2_candidates' in dir() else [])])
+        for fqn in all_candidates:
+            try:
+                jout = sp.check_output(
+                    [javap_bin, "-cp", cp, "-public", fqn],
+                    stderr=sp.DEVNULL, text=True, timeout=15)
+            except Exception:
+                continue
+            if extends_pattern in jout:
+                short = fqn.rsplit(".", 1)[1]
+                _log_ok(f"Found script runner class (relaxed): {fqn}")
+                _log_warn("Constructor signature differs from expected -- "
+                          "generated runner may need manual adjustment")
+                found = short
+                break
+
+    # ── Level 4: IClientContext-based (HeadlessClientContext name independent) ──
+    # If HeadlessClientContext itself got obfuscated, fall back to interface detection.
+    # IClientContext is in the public API package (com.pnfsoftware.jeb.client.api)
+    # and is guaranteed stable.
+    if not found:
+        _log_info("Level 3 failed. Trying IClientContext-based detection...")
+        found = _find_by_interface(jar_path, javap_bin, cp, ctor_pattern, out)
+
+    # ── Level 5: Pure behavioral (no name dependency at all) ──
+    # Find non-abstract class with ctor(boolean, String, String, String[]) + start().
+    # Does not depend on ANY class/interface name — pure method signature matching.
+    if not found:
+        _log_info("Level 4 failed. Trying pure behavioral detection...")
+        found = _find_by_behavior(jar_path, javap_bin, cp, ctor_pattern, out)
 
     if not found:
-        _log_err("Could not find HeadlessClientContext subclass with expected constructor")
-        _log_info("Known classes: JM (5.38), bC (5.37), Om (5.36)")
+        _log_err("Could not find script runner class in jeb.jar")
+        _log_info("All 5 detection levels failed. This may indicate a major "
+                  "JEB API change. Please report the JEB version.")
         return None, None
 
-    # Step 3: try to get JEB version from Launcher
+    # ── Step 3: JEB version detection ──
     version = "unknown"
     try:
         lout = sp.check_output(
             [javap_bin, "-cp", cp, "-constants", "com.pnfsoftware.jeb.Launcher"],
             stderr=sp.DEVNULL, text=True, timeout=15)
-        # Look for version string like "5.38.0" in constant pool
         ver_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', lout)
         if ver_match:
             version = ver_match.group(1)
@@ -223,6 +283,288 @@ def _find_runner_class(jeb_dir, config):
         log.warning("_find_runner_class: failed to detect JEB version: %s", _e)
 
     return found, version
+
+
+def _check_candidates_javap(candidates, package_prefix, javap_bin, cp,
+                            extends_pattern, ctor_pattern):
+    """Check candidate classes via javap for HeadlessClientContext subclass.
+
+    Args:
+        candidates: list of class names (short names if package_prefix given, FQN otherwise)
+        package_prefix: e.g. "com.pnfsoftware.jeb" or None if candidates are already FQN
+        javap_bin: path to javap
+        cp: classpath
+        extends_pattern: string to match in javap output for superclass
+        ctor_pattern: compiled regex for constructor signature
+
+    Returns:
+        Short class name if found, None otherwise.
+    """
+    import subprocess as sp
+
+    for name in sorted(candidates):
+        fqn = f"{package_prefix}.{name}" if package_prefix else name
+        try:
+            jout = sp.check_output(
+                [javap_bin, "-cp", cp, "-public", fqn],
+                stderr=sp.DEVNULL, text=True, timeout=15)
+        except Exception:
+            continue
+
+        if extends_pattern not in jout:
+            continue
+        if ctor_pattern.search(jout):
+            short = fqn.rsplit(".", 1)[1]
+            _log_ok(f"Found script runner class: {fqn}")
+            return short
+
+    return None
+
+
+def _find_by_interface(jar_path, javap_bin, cp, ctor_pattern, jar_listing):
+    """Level 4: Find runner class by inheritance chain walking (bytecode-based).
+
+    Does NOT depend on any specific class name — works even if
+    HeadlessClientContext or AbstractClientContext are obfuscated.
+
+    Strategy:
+      1. Parse .class bytecode to build inheritance map (super_class only, no javap)
+      2. Find the class implementing IClientContext (via interfaces in bytecode)
+      3. Walk the inheritance chain downward to find the concrete (non-abstract) leaf
+      4. Verify with javap only on the final candidate
+    """
+    import subprocess as sp
+    import struct
+    import zipfile
+
+    _log_info("Level 4: Building inheritance map from bytecode...")
+
+    try:
+        zf = zipfile.ZipFile(jar_path, "r")
+    except Exception as e:
+        _log_warn(f"Cannot open jar: {e}")
+        return None
+
+    # ── Build inheritance + interface maps from bytecode ──
+    inheritance = {}    # fqn -> super_class fqn
+    interfaces_of = {}  # fqn -> list of interface fqns
+    abstract_classes = set()
+
+    for entry in zf.namelist():
+        if not entry.endswith(".class") or "$" in entry:
+            continue
+        if not entry.startswith("com/pnfsoftware/jeb/"):
+            continue
+        try:
+            data = zf.read(entry)
+            this_name, super_name, ifaces, is_abstract = _parse_class_info(data)
+            if this_name:
+                inheritance[this_name] = super_name
+                interfaces_of[this_name] = ifaces
+                if is_abstract:
+                    abstract_classes.add(this_name)
+        except Exception:
+            continue
+
+    zf.close()
+
+    # ── Find root: class that implements IClientContext ──
+    iclient_fqn = "com.pnfsoftware.jeb.client.api.IClientContext"
+    roots = set()
+    for cls, ifaces in interfaces_of.items():
+        if iclient_fqn in ifaces:
+            roots.add(cls)
+
+    if not roots:
+        # IClientContext might be referenced differently; try partial match
+        for cls, ifaces in interfaces_of.items():
+            if any("IClientContext" in iface for iface in ifaces):
+                roots.add(cls)
+
+    if not roots:
+        _log_warn("No class implementing IClientContext found")
+        return None
+
+    _log_info(f"Level 4: IClientContext implementors: "
+              f"{', '.join(sorted(roots))}")
+
+    # ── Walk inheritance chain downward ──
+    # roots -> their subclasses -> ... -> concrete leaf
+    # Build reverse map: super -> children
+    children_of = {}
+    for cls, sup in inheritance.items():
+        children_of.setdefault(sup, []).append(cls)
+
+    # BFS from roots to find non-abstract leaves
+    concrete_candidates = []
+    queue = list(roots)
+    visited = set()
+    while queue:
+        cls = queue.pop(0)
+        if cls in visited:
+            continue
+        visited.add(cls)
+        if cls not in abstract_classes and cls not in roots:
+            concrete_candidates.append(cls)
+        for child in children_of.get(cls, []):
+            queue.append(child)
+
+    if not concrete_candidates:
+        # roots themselves might be concrete
+        for r in roots:
+            if r not in abstract_classes:
+                concrete_candidates.append(r)
+
+    if not concrete_candidates:
+        _log_warn("No concrete IClientContext subclass found")
+        return None
+
+    _log_info(f"Level 4: Concrete candidates: "
+              f"{', '.join(sorted(concrete_candidates))}")
+
+    # ── Verify with javap (only the few concrete candidates) ──
+    for fqn in sorted(concrete_candidates):
+        try:
+            jout = sp.check_output(
+                [javap_bin, "-cp", cp, "-public", fqn],
+                stderr=sp.DEVNULL, text=True, timeout=15)
+        except Exception:
+            continue
+
+        short = fqn.rsplit(".", 1)[1]
+        if ctor_pattern.search(jout):
+            _log_ok(f"Found script runner class (inheritance chain): {fqn}")
+            return short
+
+        # Accept without constructor match
+        _log_ok(f"Found script runner class (inheritance chain, relaxed): {fqn}")
+        _log_warn("Constructor signature differs from expected -- "
+                  "generated runner may need manual adjustment")
+        return short
+
+    return None
+
+
+def _parse_class_info(data):
+    """Parse .class bytecode to extract this_class, super_class, interfaces, and abstract flag.
+
+    Returns (this_class_fqn, super_class_fqn, [interface_fqns], is_abstract).
+    """
+    import struct
+
+    if len(data) < 10 or data[:4] != b'\xca\xfe\xba\xbe':
+        return None, None, [], False
+
+    cp_count = struct.unpack('>H', data[8:10])[0]
+    pos = 10
+    cp = {0: None}
+    i = 1
+    while i < cp_count and pos < len(data):
+        tag = data[pos]
+        pos += 1
+        if tag == 1:  # Utf8
+            ln = struct.unpack('>H', data[pos:pos + 2])[0]
+            pos += 2
+            cp[i] = data[pos:pos + ln].decode('utf-8', errors='replace')
+            pos += ln
+        elif tag == 7:  # Class ref -> name_index
+            cp[i] = ('C', struct.unpack('>H', data[pos:pos + 2])[0])
+            pos += 2
+        elif tag in (9, 10, 11, 12, 17, 18):
+            cp[i] = None
+            pos += 4
+        elif tag in (3, 4):
+            cp[i] = None
+            pos += 4
+        elif tag in (5, 6):
+            cp[i] = None
+            pos += 8
+            i += 1
+            cp[i] = None
+        elif tag == 8:
+            cp[i] = None
+            pos += 2
+        elif tag == 15:
+            cp[i] = None
+            pos += 3
+        elif tag in (16, 19, 20):
+            cp[i] = None
+            pos += 2
+        else:
+            cp[i] = None
+            pos += 2
+        i += 1
+
+    def resolve_class(idx):
+        entry = cp.get(idx)
+        if isinstance(entry, tuple) and entry[0] == 'C':
+            name = cp.get(entry[1], '')
+            return name.replace('/', '.') if isinstance(name, str) else ''
+        return ''
+
+    access_flags = struct.unpack('>H', data[pos:pos + 2])[0]
+    this_idx = struct.unpack('>H', data[pos + 2:pos + 4])[0]
+    super_idx = struct.unpack('>H', data[pos + 4:pos + 6])[0]
+    iface_count = struct.unpack('>H', data[pos + 6:pos + 8])[0]
+
+    ifaces = []
+    for j in range(iface_count):
+        iface_idx = struct.unpack('>H', data[pos + 8 + j * 2:pos + 10 + j * 2])[0]
+        ifaces.append(resolve_class(iface_idx))
+
+    is_abstract = bool(access_flags & 0x0400)
+
+    return resolve_class(this_idx), resolve_class(super_idx), ifaces, is_abstract
+
+
+def _find_by_behavior(jar_path, javap_bin, cp, ctor_pattern, jar_listing):
+    """Level 5: Pure behavioral detection — no class/interface name dependency.
+
+    Finds a non-abstract class with:
+      - Constructor: (boolean, String, String, String[])
+      - Method: start()
+    This combination is unique to the JEB script runner class across all
+    known JEB versions. Works even if every class and interface is renamed.
+
+    Only scans shallow packages (depth <= 4) to keep javap calls under ~60.
+    """
+    import subprocess as sp
+
+    candidates = []
+    for line in jar_listing.splitlines():
+        line = line.strip()
+        if not line.endswith(".class") or "$" in line:
+            continue
+        if not line.startswith("com/pnfsoftware/jeb/"):
+            continue
+        if line.count("/") > 4:  # skip deep internal packages
+            continue
+        candidates.append(line.replace("/", ".").replace(".class", ""))
+
+    _log_info(f"Level 5: {len(candidates)} shallow candidates for behavioral scan")
+
+    for fqn in sorted(candidates):
+        try:
+            jout = sp.check_output(
+                [javap_bin, "-cp", cp, "-public", fqn],
+                stderr=sp.DEVNULL, text=True, timeout=15)
+        except Exception:
+            continue
+
+        if "abstract class" in jout or "interface " in jout:
+            continue
+        if " start()" not in jout:
+            continue
+        if not ctor_pattern.search(jout):
+            continue
+
+        short = fqn.rsplit(".", 1)[1]
+        _log_ok(f"Found script runner class (behavioral): {fqn}")
+        _log_warn("Detected by method signatures only -- "
+                  "verify manually if this is a new JEB version")
+        return short
+
+    return None
 
 
 def cmd_gen_runner(ctx: CmdContext):
@@ -294,6 +636,57 @@ def cmd_gen_runner(ctx: CmdContext):
     except FileNotFoundError:
         _log_err(f"javac not found: {javac_bin}")
         _log_info("Set jeb.java_home in config.json or add Java to PATH")
+
+    # Build Java RPC server JAR if source exists
+    if not _opt(args, 'no_compile', False):
+        _build_java_server(config)
+
+
+def _build_java_server(config):
+    """Build revkit-jeb-server.jar from Java source if available."""
+    import subprocess as sp
+    server_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "server", "java")
+    build_script = os.path.join(server_dir, "build.sh")
+    src_dir = os.path.join(server_dir, "src")
+
+    if not os.path.isdir(src_dir):
+        return  # No Java server source
+
+    jeb_dir = config.get("jeb", {}).get("install_dir", "")
+    java_home = config.get("jeb", {}).get("java_home", "")
+
+    env = os.environ.copy()
+    if jeb_dir:
+        env["JEB_HOME"] = jeb_dir
+    if java_home:
+        env["JAVA_HOME"] = java_home
+        env["PATH"] = os.path.join(java_home, "bin") + os.pathsep + env.get("PATH", "")
+
+    jar_path = os.path.join(server_dir, "revkit-jeb-server.jar")
+    _log_info("Building Java RPC server...")
+
+    if os.path.isfile(build_script):
+        try:
+            result = sp.run(
+                ["bash", build_script],
+                cwd=server_dir, env=env,
+                capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                if os.path.isfile(jar_path):
+                    size_kb = os.path.getsize(jar_path) // 1024
+                    _log_ok(f"Built: revkit-jeb-server.jar ({size_kb}KB)")
+                else:
+                    _log_warn("build.sh succeeded but JAR not found")
+            else:
+                _log_err(f"Java server build failed:\n{result.stderr}")
+        except sp.TimeoutExpired:
+            _log_err("Java server build timed out (120s)")
+        except FileNotFoundError:
+            _log_err("bash not found — cannot run build.sh")
+    else:
+        _log_info(f"No build.sh at {build_script}, skipping Java server build")
 
 
 # =============================================================

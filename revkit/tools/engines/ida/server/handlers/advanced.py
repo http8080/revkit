@@ -8,6 +8,7 @@ from ..framework import (
     RpcError, _fmt_addr, _require_param, _clamp_int,
     _require_function, _require_decompiler, _resolve_addr,
     _save_output, _xref_type_str, _maybe_save_db,
+    cached_decompile, cached_func_name,
     AUTO_GENERATED_PREFIXES,
     DEFAULT_SEARCH_MAX, MAX_SEARCH_RESULTS,
     SEGPERM_EXEC, STRING_TYPE_UNICODE,
@@ -17,7 +18,8 @@ from ..framework import (
 # ── Search by constant/immediate ────────────
 
 def _handle_search_const(params):
-    """Search for immediate/constant values in instructions."""
+    """Search for immediate/constant values in instructions.
+    Optimization: uses Heads() to skip non-instruction addresses instead of byte-by-byte scan."""
     import idautils, idc, ida_ua, ida_funcs
     value = params.get("value")
     if value is None:
@@ -26,26 +28,29 @@ def _handle_search_const(params):
     max_results = _clamp_int(params, "max_results", DEFAULT_SEARCH_MAX, MAX_SEARCH_RESULTS)
     results = []
     for seg_ea in idautils.Segments():
-        ea = idc.get_segm_start(seg_ea)
-        end = idc.get_segm_end(seg_ea)
-        while ea < end and len(results) < max_results:
+        seg_start = idc.get_segm_start(seg_ea)
+        seg_end = idc.get_segm_end(seg_ea)
+        # Use Heads() to iterate only defined items (skip gaps)
+        for ea in idautils.Heads(seg_start, seg_end):
+            if len(results) >= max_results:
+                break
             insn = ida_ua.insn_t()
             length = ida_ua.decode_insn(insn, ea)
-            if length > 0:
-                for op in insn.ops:
-                    if op.type == 0:
-                        break
-                    if op.type == ida_ua.o_imm and op.value == target:
-                        func = ida_funcs.get_func(ea)
-                        results.append({
-                            "addr": _fmt_addr(ea),
-                            "func": (idc.get_func_name(ea) or "") if func else "",
-                            "disasm": idc.generate_disasm_line(ea, 0),
-                        })
-                        break
-                ea += length
-            else:
-                ea += 1
+            if length <= 0:
+                continue
+            for op in insn.ops:
+                if op.type == 0:
+                    break
+                if op.type == ida_ua.o_imm and op.value == target:
+                    func = ida_funcs.get_func(ea)
+                    results.append({
+                        "addr": _fmt_addr(ea),
+                        "func": cached_func_name(ea) if func else "",
+                        "disasm": idc.generate_disasm_line(ea, 0),
+                    })
+                    break
+        if len(results) >= max_results:
+            break
     saved_to = _save_output(params.get("output"), results, fmt="json")
     return {
         "value": _fmt_addr(target), "total": len(results), "results": results, "saved_to": saved_to,
@@ -56,9 +61,10 @@ def _handle_search_const(params):
 # ── Pseudocode search ───────────────────────
 
 def _handle_search_code(params):
-    """Search for a string within decompiled pseudocode."""
+    """Search for a string within decompiled pseudocode.
+    Optimization: uses decompiler cache to avoid re-decompiling functions."""
     _require_decompiler()
-    import ida_hexrays, idc, idautils, ida_funcs
+    import idautils, ida_funcs
     query = _require_param(params, "query")
     case_sensitive = params.get("case_sensitive", False)
     max_results = _clamp_int(params, "max_results", 20, 100)
@@ -76,19 +82,15 @@ def _handle_search_code(params):
         func = ida_funcs.get_func(ea)
         if not func:
             continue
-        try:
-            cfunc = ida_hexrays.decompile(func.start_ea)
-            if not cfunc:
-                continue
-            code = str(cfunc)
-        except Exception:
+        code = cached_decompile(func.start_ea)
+        if not code:
             continue
         if case_sensitive:
             match = query in code
         else:
             match = query_lower in code.lower()
         if match:
-            name = idc.get_func_name(func.start_ea) or ""
+            name = cached_func_name(func.start_ea)
             matching_lines = []
             for i, line in enumerate(code.split("\n")):
                 if case_sensitive:
@@ -116,17 +118,15 @@ def _handle_search_code(params):
 # ── Decompile diff ──────────────────────────
 
 def _handle_decompile_diff(params):
-    """Decompile a function and return code for diffing."""
+    """Decompile a function and return code for diffing.
+    Optimization: uses decompiler cache."""
     _require_decompiler()
-    import ida_hexrays, idc
     ea = _resolve_addr(params.get("addr"))
     func = _require_function(ea)
-    try:
-        cfunc = ida_hexrays.decompile(func.start_ea)
-        code = str(cfunc) if cfunc else ""
-    except Exception as e:
-        code = f"// Decompile failed: {e}"
-    name = idc.get_func_name(func.start_ea) or ""
+    code = cached_decompile(func.start_ea)
+    if code is None:
+        code = "// Decompile failed"
+    name = cached_func_name(func.start_ea)
     size = func.end_ea - func.start_ea
     return {
         "addr": _fmt_addr(func.start_ea), "name": name, "size": size, "code": code,
@@ -161,12 +161,12 @@ def _suggest_name_by_string(ea):
 
 def _suggest_name_by_api(ea):
     """Strategy 2: Suggest function name based on API calls."""
-    import idc, idautils, ida_xref
+    import idautils, ida_xref
     _skip_funcs = ("__security_check_cookie", "memset_0", "_guard_dispatch_icall")
     api_calls = []
     for item_ea in idautils.FuncItems(ea):
         for xref in idautils.XrefsFrom(item_ea):
-            target_name = idc.get_func_name(xref.to)
+            target_name = cached_func_name(xref.to)
             if target_name and not target_name.startswith("sub_") and not target_name.startswith("nullsub_"):
                 if xref.type in (ida_xref.fl_CF, ida_xref.fl_CN):
                     api_calls.append(target_name)
@@ -182,6 +182,7 @@ def _suggest_name_by_api(ea):
 def _handle_auto_rename(params):
     """Heuristic-based automatic function renaming."""
     import idc, idautils, ida_funcs
+    from ..framework import invalidate_func_name_cache
     max_funcs = _clamp_int(params, "max_funcs", 200, 1000)
     dry_run = params.get("dry_run", True)
 
@@ -190,7 +191,7 @@ def _handle_auto_rename(params):
     for ea in idautils.Functions():
         if count >= max_funcs:
             break
-        name = idc.get_func_name(ea)
+        name = cached_func_name(ea)
         if not name or not name.startswith("sub_"):
             continue
         count += 1
@@ -209,6 +210,7 @@ def _handle_auto_rename(params):
             })
             if not dry_run:
                 idc.set_name(ea, suggested, idc.SN_NOWARN | idc.SN_NOCHECK)
+                invalidate_func_name_cache(ea)
 
     if not dry_run and renames:
         _maybe_save_db()
@@ -230,7 +232,7 @@ def _collect_func_metadata():
     rename_lines, comment_lines, type_lines = [], [], []
     for ea in idautils.Functions():
         addr = _fmt_addr(ea)
-        name = idc.get_func_name(ea)
+        name = cached_func_name(ea)
         if name and not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
             rename_lines.append(f'idc.set_name({addr}, "{name}", idc.SN_NOWARN)')
         cmt = idc.get_cmt(ea, False)
@@ -286,7 +288,8 @@ def _handle_export_script(params):
 # ── VTable detection ────────────────────────
 
 def _handle_detect_vtables(params):
-    """Detect virtual function tables in data segments."""
+    """Detect virtual function tables in data segments.
+    Optimization: uses Heads() to skip to named locations, cached func names."""
     import idc, idautils, ida_funcs, ida_bytes, ida_segment
     max_results = _clamp_int(params, "max_results", 50, 200)
     try:
@@ -303,8 +306,10 @@ def _handle_detect_vtables(params):
         perm = seg.perm
         if perm & SEGPERM_EXEC:
             continue
-        ea = seg.start_ea
-        while ea < seg.end_ea and len(vtables) < max_results:
+        # Use Heads() to iterate only defined data items (skip gaps)
+        for ea in idautils.Heads(seg.start_ea, seg.end_ea):
+            if len(vtables) >= max_results:
+                break
             if ptr_size == 8:
                 val = ida_bytes.get_qword(ea)
             else:
@@ -321,7 +326,7 @@ def _handle_detect_vtables(params):
                         entries.append({
                             "offset": check_ea - ea,
                             "addr": _fmt_addr(ptr_val),
-                            "name": idc.get_func_name(ptr_val) or "",
+                            "name": cached_func_name(ptr_val),
                         })
                         check_ea += ptr_size
                     else:
@@ -332,9 +337,6 @@ def _handle_detect_vtables(params):
                         "entries": len(entries),
                         "functions": entries[:20],
                     })
-                    ea = check_ea
-                    continue
-            ea += ptr_size
     return {
         "total": len(vtables), "ptr_size": ptr_size, "vtables": vtables,
         "hint": "total = vtable count, not entry count. Each vtable has entries (int) and functions (list).",
@@ -397,9 +399,10 @@ def _handle_list_sigs(params):
 # ── Decompile All ───────────────────────────
 
 def _handle_decompile_all(params):
-    """Decompile all (or filtered) functions and save to a .c file."""
+    """Decompile all (or filtered) functions and save to a .c file.
+    Optimization: uses decompiler cache."""
     _require_decompiler()
-    import ida_hexrays, idc, idautils, ida_funcs
+    import idautils, ida_funcs
     filt = params.get("filter", "")
     skip_thunks = params.get("skip_thunks", True)
     skip_libs = params.get("skip_libs", True)
@@ -413,7 +416,7 @@ def _handle_decompile_all(params):
         func = ida_funcs.get_func(ea)
         if not func:
             continue
-        name = idc.get_func_name(ea) or ""
+        name = cached_func_name(ea)
         if filt and filt.lower() not in name.lower():
             continue
         if skip_thunks and (func.flags & ida_funcs.FUNC_THUNK):
@@ -422,14 +425,11 @@ def _handle_decompile_all(params):
         if skip_libs and (func.flags & ida_funcs.FUNC_LIB):
             skipped += 1
             continue
-        try:
-            cfunc = ida_hexrays.decompile(func.start_ea)
-            if cfunc:
-                results.append(f"// \u2500\u2500 {name} ({_fmt_addr(ea)}) \u2500\u2500\n{str(cfunc)}")
-                success += 1
-            else:
-                failed += 1
-        except Exception:
+        code = cached_decompile(func.start_ea)
+        if code:
+            results.append(f"// \u2500\u2500 {name} ({_fmt_addr(ea)}) \u2500\u2500\n{code}")
+            success += 1
+        else:
             failed += 1
 
     split = params.get("split", False)
@@ -471,7 +471,8 @@ def _handle_decompile_all(params):
 # ── Strings with Xrefs ─────────────────────
 
 def _handle_strings_xrefs(params):
-    """Get strings with their referencing functions in one call."""
+    """Get strings with their referencing functions in one call.
+    Optimization: uses cached func name lookups, filter before decode."""
     import idautils, idc, ida_funcs
     filt = params.get("filter", "")
     max_results = _clamp_int(params, "max_results", DEFAULT_SEARCH_MAX, MAX_SEARCH_RESULTS)
@@ -479,6 +480,7 @@ def _handle_strings_xrefs(params):
         min_refs = max(0, int(params.get("min_refs", 0)))
     except (ValueError, TypeError):
         min_refs = 0
+    filt_lower = filt.lower() if filt else ""
 
     results = []
     for s in idautils.Strings():
@@ -491,7 +493,7 @@ def _handle_strings_xrefs(params):
             decoded = val.decode("utf-8", errors="replace")
         except Exception:
             decoded = val.hex()
-        if filt and filt.lower() not in decoded.lower():
+        if filt_lower and filt_lower not in decoded.lower():
             continue
         refs = []
         for xref in idautils.XrefsTo(s.ea):
@@ -499,7 +501,7 @@ def _handle_strings_xrefs(params):
             refs.append({
                 "addr": _fmt_addr(xref.frm),
                 "func_addr": _fmt_addr(func.start_ea) if func else None,
-                "func_name": idc.get_func_name(func.start_ea) if func else "",
+                "func_name": cached_func_name(func.start_ea) if func else "",
                 "type": _xref_type_str(xref.type),
             })
         if min_refs and len(refs) < min_refs:
@@ -519,8 +521,9 @@ def _handle_strings_xrefs(params):
 # ── Function Similarity ─────────────────────
 
 def _handle_func_similarity(params):
-    """Compare two functions by size, basic blocks, and call graph."""
-    import ida_funcs, ida_gdl, idc, idautils
+    """Compare two functions by size, basic blocks, and call graph.
+    Optimization: uses cached func names, deduped xref lookups."""
+    import ida_funcs, ida_gdl, idautils
     ea_a = _resolve_addr(_require_param(params, "addr_a"))
     ea_b = _resolve_addr(_require_param(params, "addr_b"))
     func_a = _require_function(ea_a)
@@ -529,15 +532,18 @@ def _handle_func_similarity(params):
     def _func_metrics(func):
         block_count = sum(1 for _ in ida_gdl.FlowChart(func))
         callees = set()
+        seen_targets = set()
         for item_ea in idautils.FuncItems(func.start_ea):
             for xref in idautils.XrefsFrom(item_ea):
                 target = ida_funcs.get_func(xref.to)
                 if target and target.start_ea != func.start_ea:
-                    callees.add(idc.get_func_name(target.start_ea)
-                                or _fmt_addr(target.start_ea))
+                    if target.start_ea not in seen_targets:
+                        seen_targets.add(target.start_ea)
+                        callees.add(cached_func_name(target.start_ea)
+                                    or _fmt_addr(target.start_ea))
         return {
             "addr": _fmt_addr(func.start_ea),
-            "name": idc.get_func_name(func.start_ea) or "",
+            "name": cached_func_name(func.start_ea),
             "size": func.size(),
             "block_count": block_count,
             "callee_count": len(callees),
@@ -570,7 +576,8 @@ def _handle_func_similarity(params):
 # ── Data Refs ───────────────────────────────
 
 def _handle_data_refs(params):
-    """Analyze data references: named globals in data segments with xrefs."""
+    """Analyze data references: named globals in data segments with xrefs.
+    Optimization: uses cached func name lookups."""
     import idautils, idc, ida_segment, ida_funcs
     filt = params.get("filter", "")
     max_results = _clamp_int(params, "max_results", DEFAULT_SEARCH_MAX, MAX_SEARCH_RESULTS)
@@ -606,7 +613,7 @@ def _handle_data_refs(params):
                 func = ida_funcs.get_func(xref.frm)
                 refs.append({
                     "addr": _fmt_addr(xref.frm),
-                    "func": idc.get_func_name(func.start_ea) if func else "",
+                    "func": cached_func_name(func.start_ea) if func else "",
                     "type": _xref_type_str(xref.type),
                 })
             results.append({

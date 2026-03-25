@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .auth import authenticate, extract_bearer_token, extract_client_ip
@@ -92,7 +93,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 class GatewayDaemon(ThreadingHTTPServer):
-    """ThreadingHTTPServer subclass carrying gateway config and audit logger."""
+    """ThreadingHTTPServer with bounded thread pool to prevent DoS.
+
+    Max workers defaults to 50 (configurable via gateway.max_workers).
+    Excess connections queue until a worker becomes available.
+    """
 
     allow_reuse_address = True
     daemon_threads = True
@@ -104,9 +109,15 @@ class GatewayDaemon(ThreadingHTTPServer):
     ):
         self.gw_config = gw_config
         self.audit_logger = audit_logger
+        max_workers = gw_config.get("max_workers", 50)
+        self._pool = ThreadPoolExecutor(max_workers=max_workers)
         host = gw_config.get("host", "0.0.0.0")
         port = gw_config.get("port", 8080)
         super().__init__((host, port), GatewayHandler)
+
+    def process_request(self, request, client_address):
+        """Submit request to bounded thread pool instead of spawning unlimited threads."""
+        self._pool.submit(self.process_request_thread, request, client_address)
 
     def health(self) -> dict:
         """Return gateway health status."""

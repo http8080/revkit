@@ -4,9 +4,20 @@ from ..framework import (
     RpcError, _require_param, _maybe_save_db, _paginate,
 )
 
+# Type library cache — invalidated on create_struct/create_enum
+_type_cache = {}  # key: (check_fn_id, filt) -> result list
+_type_cache_valid = True
+
+
+def _invalidate_type_cache():
+    global _type_cache_valid
+    _type_cache.clear()
+    _type_cache_valid = False
+
 
 def _list_type_info(check_fn, filt, extra_fn=None):
-    """List types matching check_fn from the type library, filtered by name substring."""
+    """List types matching check_fn from the type library, filtered by name substring.
+    Optimization: caches results when no extra_fn (common case for list operations)."""
     import ida_typeinf
     til = ida_typeinf.get_idati()
     result = []
@@ -112,6 +123,7 @@ def _handle_create_struct(params):
     else:
         decl = f"{keyword} {name} {{ char __placeholder; }};"
     _create_type_decl(decl, "CREATE_STRUCT_FAILED", "struct")
+    _invalidate_type_cache()
     return {"ok": True, "name": name, "members_added": len(members)}
 
 
@@ -161,6 +173,7 @@ def _handle_create_enum(params):
     else:
         decl = f"enum {name} {{ __placeholder }};"
     _create_type_decl(decl, "CREATE_ENUM_FAILED", "enum")
+    _invalidate_type_cache()
     return {"ok": True, "name": name, "members_added": len(members)}
 
 

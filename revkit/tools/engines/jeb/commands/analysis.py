@@ -253,7 +253,7 @@ def cmd_decompile_batch(ctx: CmdContext):
     if len(sigs) > 20:
         _log_warn("Limiting to first 20 signatures")
         sigs = sigs[:20]
-    p = {"sigs": sigs}
+    p = {"class_sigs": sigs}
     _maybe_output_param(args, p, md_out)
     r = _rpc_call(args, config, "decompile_batch", p)
     if not r:

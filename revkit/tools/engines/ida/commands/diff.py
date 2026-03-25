@@ -231,17 +231,36 @@ def cmd_compare(ctx: CmdContext):
 
 
 def _compute_code_diffs(config, func_names, port_a, port_b, iid_a, iid_b, bin_a, bin_b):
-    """Decompile and diff each function, return list of diffs."""
+    """Decompile and diff each function, return list of diffs.
+    Optimization: batch decompile all functions per instance (2 RPCs instead of 2N)."""
     import difflib
+    if not func_names:
+        return []
+
+    # Batch decompile: 2 RPC calls total instead of 2N
+    resp_a = post_rpc(config, port_a, "decompile_batch", iid_a, {"addrs": list(func_names)})
+    resp_b = post_rpc(config, port_b, "decompile_batch", iid_b, {"addrs": list(func_names)})
+
+    # Index results by function name for O(1) lookup
+    def _index_batch(resp):
+        results = resp.get("result", {}).get("results", [])
+        by_name = {}
+        for r in results:
+            name = r.get("name", "")
+            if name and "code" in r:
+                by_name[name] = r["code"]
+        return by_name
+
+    codes_a = _index_batch(resp_a) if "error" not in resp_a else {}
+    codes_b = _index_batch(resp_b) if "error" not in resp_b else {}
+
     all_diffs = []
     for name in func_names:
-        resp_a = post_rpc(config, port_a, "decompile_diff", iid_a, {"addr": name})
-        resp_b = post_rpc(config, port_b, "decompile_diff", iid_b, {"addr": name})
-        if "error" in resp_a or "error" in resp_b:
+        code_a = codes_a.get(name)
+        code_b = codes_b.get(name)
+        if code_a is None or code_b is None:
             _log_err(f"Cannot decompile: {name}")
             continue
-        code_a = resp_a.get("result", {}).get("code", "")
-        code_b = resp_b.get("result", {}).get("code", "")
         if isinstance(code_a, list):
             code_a = "\n".join(code_a)
         if isinstance(code_b, list):

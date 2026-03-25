@@ -194,15 +194,38 @@ def _registry_locked():
     return _registry_locked_raw(_IDA_REGISTRY_PATH)
 
 
+# Registry mtime cache — avoids repeated disk reads in polling loops
+_registry_cache: dict | None = None
+_registry_cache_mtime: float = 0.0
+
+
 def load_registry() -> dict:
-    """Load IDA registry as ``{instance_id: info_dict}``."""
+    """Load IDA registry as ``{instance_id: info_dict}``.
+    Optimization: caches result and only re-reads from disk if file mtime changed."""
+    global _registry_cache, _registry_cache_mtime
+    try:
+        mtime = os.path.getmtime(_IDA_REGISTRY_PATH)
+    except OSError:
+        return {}
+    if _registry_cache is not None and mtime == _registry_cache_mtime:
+        return dict(_registry_cache)  # Return copy to prevent mutation
     entries = _load_registry_raw(_IDA_REGISTRY_PATH)
-    return {e["id"]: e for e in entries if "id" in e}
+    _registry_cache = {e["id"]: e for e in entries if "id" in e}
+    _registry_cache_mtime = mtime
+    return dict(_registry_cache)
+
+
+def _invalidate_registry_cache():
+    """Force next load_registry() to read from disk."""
+    global _registry_cache, _registry_cache_mtime
+    _registry_cache = None
+    _registry_cache_mtime = 0.0
 
 
 def save_registry(registry: dict) -> None:
     """Save IDA registry from ``{instance_id: info_dict}``."""
     _save_registry_raw(_IDA_REGISTRY_PATH, list(registry.values()))
+    _invalidate_registry_cache()
 
 
 def cleanup_stale(registry: dict, threshold: float = 120.0) -> None:

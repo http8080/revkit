@@ -5,15 +5,16 @@ import os
 from .. import framework as _fw
 from ..framework import (
     _fmt_addr, _paginate, _perm_str, STRING_TYPE_UNICODE,
+    cached_func_name,
 )
 
 
 def _handle_get_functions(params):
-    import idc, idautils, ida_funcs
+    import idautils, ida_funcs
     filt = params.get("filter")
     funcs = []
     for ea in idautils.Functions():
-        name = idc.get_func_name(ea)
+        name = cached_func_name(ea)
         if filt and filt.lower() not in name.lower():
             continue
         func = ida_funcs.get_func(ea)
@@ -122,26 +123,28 @@ def _get_imports_summary():
 
 
 def _get_strings_sample(top_count):
-    """Get a sample of strings and total count."""
+    """Get a sample of strings and total count.
+    Optimization: single pass — collects sample and counts total simultaneously."""
     import idc, idautils
     sample = []
-    for i, s in enumerate(idautils.Strings()):
-        if i >= top_count:
-            break
-        val = idc.get_strlit_contents(s.ea, s.length, s.strtype)
-        if val:
-            try:
-                decoded = val.decode("utf-8", errors="replace")
-            except Exception:
-                decoded = val.hex()
-            sample.append({"addr": _fmt_addr(s.ea), "value": decoded[:100]})
-    total = sum(1 for _ in idautils.Strings())
+    total = 0
+    for s in idautils.Strings():
+        total += 1
+        if len(sample) < top_count:
+            val = idc.get_strlit_contents(s.ea, s.length, s.strtype)
+            if val:
+                try:
+                    decoded = val.decode("utf-8", errors="replace")
+                except Exception:
+                    decoded = val.hex()
+                sample.append({"addr": _fmt_addr(s.ea), "value": decoded[:100]})
     return sample, total
 
 
 def _get_function_stats():
-    """Get function size distribution and largest functions."""
-    import idc, idautils, ida_funcs
+    """Get function size distribution and largest functions.
+    Optimization: uses cached func names."""
+    import idautils, ida_funcs
     sizes = []
     for ea in idautils.Functions():
         func = ida_funcs.get_func(ea)
@@ -152,7 +155,7 @@ def _get_function_stats():
     for ea, size in sizes[:10]:
         largest.append({
             "addr": _fmt_addr(ea),
-            "name": idc.get_func_name(ea) or "",
+            "name": cached_func_name(ea),
             "size": size,
         })
     all_sizes = [s for _, s in sizes]
@@ -161,8 +164,9 @@ def _get_function_stats():
 
 
 def _handle_summary(params):
-    """Return a comprehensive binary overview in one call."""
-    import idautils, ida_kernwin
+    """Return a comprehensive binary overview in one call.
+    Optimization: reuses cached func names, single-pass strings, counted exports."""
+    import idautils, ida_kernwin, ida_funcs
     func_count, largest_funcs, avg_func_size = _get_function_stats()
     segments = _get_segments_info()
     top_imports, total_imports = _get_imports_summary()
@@ -171,6 +175,13 @@ def _handle_summary(params):
     except (ValueError, TypeError):
         top_count = 20
     strings_sample, total_strings = _get_strings_sample(top_count)
+    # Use ida_funcs.get_func_qty() for exact function count if available
+    try:
+        exact_func_count = ida_funcs.get_func_qty()
+        if exact_func_count > 0:
+            func_count = exact_func_count
+    except Exception:
+        pass
     export_count = sum(1 for _ in idautils.Entries())
     return {
         "binary": os.path.basename(_fw._binary_path),

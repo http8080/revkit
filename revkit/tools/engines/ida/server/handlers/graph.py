@@ -2,7 +2,7 @@
 
 from ..framework import (
     _fmt_addr, _resolve_addr, _clamp_int, _require_function,
-    _save_output, _xref_type_str,
+    _save_output, _xref_type_str, cached_func_name,
 )
 
 
@@ -32,8 +32,29 @@ def _generate_mermaid_graph(nodes, edges):
 
 
 def _collect_call_graph(start_ea, depth, direction, nodes, edges):
-    """Recursively collect call graph nodes and edges."""
-    import idc, ida_funcs, idautils
+    """Recursively collect call graph nodes and edges.
+    Optimization: memoize callees per function to avoid re-scanning FuncItems,
+    use cached func names, deduplicate caller xrefs."""
+    import ida_funcs, idautils
+
+    # Memoize callees: ea -> set of callee start_eas
+    _callees_memo = {}
+
+    def _get_callees(func_ea):
+        if func_ea in _callees_memo:
+            return _callees_memo[func_ea]
+        func = ida_funcs.get_func(func_ea)
+        if not func:
+            _callees_memo[func_ea] = set()
+            return set()
+        callees = set()
+        for item_ea in idautils.FuncItems(func.start_ea):
+            for xref in idautils.XrefsFrom(item_ea):
+                target = ida_funcs.get_func(xref.to)
+                if target and target.start_ea != func.start_ea:
+                    callees.add(target.start_ea)
+        _callees_memo[func_ea] = callees
+        return callees
 
     def _walk(ea, cur_depth):
         if cur_depth > depth:
@@ -41,24 +62,18 @@ def _collect_call_graph(start_ea, depth, direction, nodes, edges):
         addr_str = _fmt_addr(ea)
         if addr_str in nodes:
             return
-        nodes[addr_str] = idc.get_func_name(ea) or addr_str
+        nodes[addr_str] = cached_func_name(ea) or addr_str
         if direction == "callees":
-            func = ida_funcs.get_func(ea)
-            if not func:
-                return
-            seen = set()
-            for item_ea in idautils.FuncItems(func.start_ea):
-                for xref in idautils.XrefsFrom(item_ea):
-                    target = ida_funcs.get_func(xref.to)
-                    if target and target.start_ea != func.start_ea and target.start_ea not in seen:
-                        seen.add(target.start_ea)
-                        t_addr = _fmt_addr(target.start_ea)
-                        edges.append((addr_str, t_addr))
-                        _walk(target.start_ea, cur_depth + 1)
+            for callee_ea in _get_callees(ea):
+                t_addr = _fmt_addr(callee_ea)
+                edges.append((addr_str, t_addr))
+                _walk(callee_ea, cur_depth + 1)
         else:  # callers
+            seen_callers = set()
             for xref in idautils.XrefsTo(ea):
                 caller_func = ida_funcs.get_func(xref.frm)
-                if caller_func and caller_func.start_ea != ea:
+                if caller_func and caller_func.start_ea != ea and caller_func.start_ea not in seen_callers:
+                    seen_callers.add(caller_func.start_ea)
                     c_addr = _fmt_addr(caller_func.start_ea)
                     edges.append((c_addr, addr_str))
                     _walk(caller_func.start_ea, cur_depth + 1)
@@ -99,7 +114,8 @@ def _handle_callgraph(params):
 
 
 def _handle_cross_refs(params):
-    """Trace xref chains N levels deep from an address."""
+    """Trace xref chains N levels deep from an address.
+    Optimization: uses cached func names, deduplicates edges."""
     import idautils, idc, ida_funcs
     ea = _resolve_addr(params.get("addr"))
     depth = _clamp_int(params, "depth", 3, 10)
@@ -112,7 +128,7 @@ def _handle_cross_refs(params):
         addr_str = _fmt_addr(cur_ea)
         if addr_str in nodes:
             return
-        name = idc.get_func_name(cur_ea) or idc.get_name(cur_ea) or addr_str
+        name = cached_func_name(cur_ea) or idc.get_name(cur_ea) or addr_str
         nodes[addr_str] = {"name": name, "level": cur_depth}
         if cur_depth >= depth:
             return

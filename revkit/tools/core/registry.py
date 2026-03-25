@@ -178,7 +178,23 @@ def _cleanup_stale_impl(
         iid = entry.get("id", "?")
         if state == "initializing":
             if now - entry.get("started", 0) > INIT_STALE_TIMEOUT:
+                pid = entry.get("pid")
+                if pid:
+                    from .process import force_kill
+                    force_kill(pid)
+                    log.warning("cleanup_stale: killed init-timeout PID %d for %s", pid, iid)
                 removed.append((iid, "init_timeout"))
+                continue
+        # Port-less entries stuck in analyzing (e.g., server crash before ready)
+        if not entry.get("port") and state not in ("initializing",):
+            age = now - entry.get("started", 0)
+            if age > INIT_STALE_TIMEOUT:
+                pid = entry.get("pid")
+                if pid:
+                    from .process import force_kill
+                    force_kill(pid)
+                    log.warning("cleanup_stale: killed port-less PID %d for %s (age=%.0fs)", pid, iid, age)
+                removed.append((iid, "no_port_stale"))
                 continue
         if state == "error":
             if not _is_process_alive(entry):
@@ -215,14 +231,17 @@ def register_instance(
     entry: dict,
     max_instances: int = 5,
 ) -> None:
-    """Register a new instance. Auto-cleans stale entries first (D1).
+    """Register a new instance. Auto-cleans stale entries only when needed.
 
     Raises:
         RuntimeError: max instances exceeded or duplicate active binary.
     """
     registry_path = Path(registry_path)
     with registry_locked(registry_path):
-        entries = cleanup_stale(registry_path)
+        entries = load_registry(registry_path)
+        # Lazy cleanup: only run expensive cleanup_stale if near capacity
+        if len(entries) >= max_instances - 1:
+            entries = _cleanup_stale_impl(registry_path, DEFAULT_STALE_THRESHOLD)
         if len(entries) >= max_instances:
             raise RuntimeError(
                 f"Max instances reached ({max_instances})"

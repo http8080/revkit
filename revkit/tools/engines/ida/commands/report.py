@@ -337,18 +337,39 @@ def _collect_report_data(config, port, iid, sections):
 
 
 def _collect_report_functions(config, port, iid, func_addrs, sections):
-    """Decompile specific functions into report sections."""
+    """Decompile specific functions into report sections.
+    Optimization: batch decompile all functions first (1 RPC), then individual xref calls only for successes."""
     if not func_addrs:
         return
     sections += ["## Decompiled Functions", ""]
+
+    # Batch decompile: 1 RPC instead of N
+    batch_resp = post_rpc(config, port, "decompile_batch", iid, {"addrs": list(func_addrs)})
+    batch_results = {}
+    if "result" in batch_resp:
+        for r in batch_resp["result"].get("results", []):
+            if "code" in r:
+                batch_results[r.get("addr", "")] = r
+
     for addr in func_addrs:
-        _log_info(f"Decompiling {addr}...")
-        resp = post_rpc(config, port, "decompile_with_xrefs", iid, {"addr": addr})
-        if "result" in resp:
-            sections.append(_md_decompile(resp["result"], with_xrefs=True))
+        batch_entry = batch_results.get(addr)
+        if batch_entry:
+            # Build result compatible with _md_decompile(with_xrefs=True)
+            result = {"addr": addr, "name": batch_entry.get("name", ""),
+                      "code": batch_entry["code"]}
+            # Fetch xrefs separately (lightweight RPC, no decompile needed)
+            xref_resp = post_rpc(config, port, "xrefs_to", iid, {"addr": addr})
+            if "result" in xref_resp:
+                result["callers"] = xref_resp["result"].get("xrefs", [])
+            sections.append(_md_decompile(result, with_xrefs=True))
         else:
-            err = resp.get("error", {}).get("message", "unknown error")
-            sections += [f"### `{addr}` - Error", f"> {err}"]
+            _log_info(f"Decompiling {addr}...")
+            resp = post_rpc(config, port, "decompile_with_xrefs", iid, {"addr": addr})
+            if "result" in resp:
+                sections.append(_md_decompile(resp["result"], with_xrefs=True))
+            else:
+                err = resp.get("error", {}).get("message", "unknown error")
+                sections += [f"### `{addr}` - Error", f"> {err}"]
         sections.append("")
 
 

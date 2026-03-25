@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import sys
+from collections import OrderedDict
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -141,6 +142,83 @@ _binary_path = None
 _config = None
 _decompiler_available = False
 log = logging.getLogger("ida-headless")
+
+
+# ─────────────────────────────────────────────
+# Decompiler cache (Optimization: avoid repeated decompile)
+# ─────────────────────────────────────────────
+
+_decompile_cache = OrderedDict()
+_DECOMPILE_CACHE_MAX = 500
+
+
+def cached_decompile(ea):
+    """Decompile function at ea with LRU caching. Returns code string or None."""
+    import ida_hexrays, ida_funcs
+    func = ida_funcs.get_func(ea)
+    if not func:
+        return None
+    key = func.start_ea
+    cached = _decompile_cache.get(key)
+    if cached is not None:
+        _decompile_cache.move_to_end(key)  # LRU: mark as recently used
+        return cached
+    try:
+        cfunc = ida_hexrays.decompile(func.start_ea)
+        if not cfunc:
+            return None
+        code = str(cfunc)
+    except Exception:
+        return None
+    _decompile_cache[key] = code
+    # Evict least-recently-used entries if cache is full
+    while len(_decompile_cache) > _DECOMPILE_CACHE_MAX:
+        _decompile_cache.popitem(last=False)
+    return code
+
+
+def invalidate_decompile_cache(ea=None):
+    """Invalidate decompiler cache. ea=None clears all."""
+    if ea is None:
+        _decompile_cache.clear()
+    else:
+        _decompile_cache.pop(ea, None)
+
+
+# ─────────────────────────────────────────────
+# Function name cache (Optimization: avoid repeated get_func_name)
+# ─────────────────────────────────────────────
+
+_func_name_cache = OrderedDict()
+_FUNC_NAME_CACHE_MAX = 5000
+
+
+def cached_func_name(ea):
+    """Get function name with LRU caching (max 5000 entries)."""
+    cached = _func_name_cache.get(ea)
+    if cached is not None:
+        _func_name_cache.move_to_end(ea)
+        return cached
+    import idc
+    name = idc.get_func_name(ea) or ""
+    _func_name_cache[ea] = name
+    while len(_func_name_cache) > _FUNC_NAME_CACHE_MAX:
+        _func_name_cache.popitem(last=False)
+    return name
+
+
+def invalidate_func_name_cache(ea=None):
+    """Invalidate function name cache."""
+    if ea is None:
+        _func_name_cache.clear()
+    else:
+        _func_name_cache.pop(ea, None)
+
+
+def cached_get_func(ea):
+    """Get func_t for ea, with result caching for xref-heavy lookups."""
+    import ida_funcs
+    return ida_funcs.get_func(ea)
 
 
 # ─────────────────────────────────────────────
@@ -347,7 +425,7 @@ def _paginate(all_data, params):
     offset = max(0, int(params.get("offset", 0)))
     count = max(0, min(int(params.get("count", cfg_out["default_count"])), cfg_out["max_count"]))
     data = all_data[offset:offset + count]
-    saved_to = _save_output(params.get("output"), data, fmt="json")
+    saved_to = _save_output(params.get("output"), data, fmt="json") if params.get("output") else None
     return {"total": len(all_data), "offset": offset, "count": len(data),
             "data": data, "saved_to": saved_to}
 
@@ -398,14 +476,19 @@ def _xref_type_str(xtype):
     return "unknown"
 
 
+_first_segment_ea = None
+
+
 def _resolve_start_addr(params, key="start"):
-    """Resolve optional start address from params, defaulting to first segment."""
-    import idautils
+    """Resolve optional start address from params, defaulting to first segment (cached)."""
+    global _first_segment_ea
     start_str = params.get(key)
     if start_str:
         return _resolve_addr(start_str)
-    segs = list(idautils.Segments())
-    return segs[0] if segs else 0
+    if _first_segment_ea is None:
+        import idautils
+        _first_segment_ea = next(iter(idautils.Segments()), 0)
+    return _first_segment_ea
 
 
 # ─────────────────────────────────────────────

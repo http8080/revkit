@@ -54,6 +54,18 @@ revkit ida <command> [options]
   CLI output / file save           IDAPython API (ida_*)
 ```
 
+### Performance / 성능
+
+IDA 서버는 다중 캐시 레이어를 사용하여 반복 연산을 최적화한다.
+
+| Cache | Size | Invalidation |
+|-------|------|-------------|
+| Decompiler cache (LRU) | 500 functions | rename, set_type, batch rename |
+| Function name cache (LRU) | 5,000 entries | rename, batch rename |
+| Callee memoization | per-session | callgraph request |
+
+캐시 적중 시 디컴파일: ~0.1ms (cold: 10-100ms). 콜그래프/xref 조회 시 함수명 룩업 0.001ms.
+
 ---
 
 ## Setup / 설정

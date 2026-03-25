@@ -52,9 +52,9 @@ def _handle_ping():
 
 
 def _handle_status():
-    import ida_kernwin, ida_loader, idautils
+    import ida_kernwin, ida_loader, ida_funcs
     from core.utils import file_md5
-    func_count = sum(1 for _ in idautils.Functions())
+    func_count = ida_funcs.get_func_qty()
     idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
     return {
         "state": "ready",
@@ -209,9 +209,16 @@ _METHOD_DESCRIPTIONS = [
 ]
 
 
+# Global lock for IDA API calls — IDA database is NOT thread-safe.
+# ThreadingHTTPServer creates a thread per request, so concurrent
+# handler calls could corrupt the database without serialization.
+_ida_api_lock = threading.Lock()
+
+
 def _dispatch(method, params):
     handler = _METHODS.get(method)
     if not handler:
         raise RpcError("UNKNOWN_METHOD", f"Unknown method: {method}",
                         suggestion="Call 'methods' to list available APIs")
-    return handler(params)
+    with _ida_api_lock:
+        return handler(params)
